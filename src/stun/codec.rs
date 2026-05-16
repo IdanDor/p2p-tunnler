@@ -9,14 +9,14 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 use std::net::IpAddr;
-use std::net::Ipv4Addr;
 use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use futures::Sink;
 use futures::SinkExt;
 use futures::Stream;
-use futures::TryStream;
 use futures::StreamExt;
+use futures::TryStream;
 
 use byteorder::NetworkEndian;
 use byteorder::ReadBytesExt;
@@ -24,6 +24,8 @@ use byteorder::WriteBytesExt;
 use bytes::BufMut;
 //use ring::constant_time::verify_slices_are_equal;
 //use ring::digest;
+
+pub const MAGIC_COOKIE: u32 = 0x2112A442;
 
 #[derive(Debug, Clone)]
 pub enum Request {
@@ -84,14 +86,15 @@ pub enum Response {
 #[derive(Debug)]
 pub struct BindResponse {
     pub mapped_address: SocketAddr,
-    pub source_address: SocketAddr,
-    pub changed_address: SocketAddr,
+    pub source_address: Option<SocketAddr>,
+    pub changed_address: Option<SocketAddr>,
     pub reflected_from: Option<SocketAddr>,
 }
 
 #[derive(Default)]
 pub struct StunCodec;
 
+#[derive(Debug)]
 pub enum Attribute {
     MappedAddress(SocketAddr),
     ResponseAddress(SocketAddr),
@@ -120,7 +123,8 @@ impl StunCodec {
         buf.put_u16(typ);
         // buf.write_u16::<NetworkEndian>(m.len() as u16 + 24).unwrap();
         buf.put_u16(m.len() as u16);
-        buf.put_u64(0);
+        // Send magic cookie, still use transaction ids which are only 8 bytes.
+        buf.put_u64((MAGIC_COOKIE as u64) << 32);
         buf.put_u64(trans_id);
         buf.put_slice(&m);
 
@@ -142,8 +146,7 @@ impl StunCodec {
         */
     }
 
-
-    fn read_binding_response(_msg: &[u8], c: &mut Cursor<&[u8]>) -> Result<BindResponse> {
+    fn read_binding_response(c: &mut Cursor<Vec<u8>>) -> Result<BindResponse> {
         let mut mapped_address = None;
         let mut source_address = None;
         let mut changed_address = None;
@@ -188,21 +191,15 @@ impl StunCodec {
 
         Ok(BindResponse {
             mapped_address: mapped_address.ok_or_else(|| error("MappedAddress missing!"))?,
-            source_address: source_address.ok_or_else(|| error("SourceAddress missing!"))?,
-            changed_address: changed_address.ok_or_else(|| error("ChangedAddress missing!"))?,
+            source_address,
+            changed_address,
             reflected_from,
         })
     }
 
-    pub fn decode_stream(stream: impl Stream<Item=(impl AsRef<[u8]>, SocketAddr)>) -> impl TryStream<Ok=((u64, Response), SocketAddr), Error=Error> {
-        stream.filter_map(|(buf, peer)| {
-            let pkt = StunCodec::decode_const(buf.as_ref()).ok().flatten();
-            futures::future::ready(pkt.map(|pkt| Ok((pkt, peer))))
-        })
-    }
-
-    pub fn encode_sink(sink: impl Sink<(bytes::Bytes, SocketAddr), Error=Error> + Unpin) -> impl Sink<((u64, Request), SocketAddr), Error=Error> + Unpin
-    {
+    pub fn encode_sink(
+        sink: impl Sink<(bytes::Bytes, SocketAddr), Error = Error> + Unpin,
+    ) -> impl Sink<((u64, Request), SocketAddr), Error = Error> + Unpin {
         sink.with(|((id, req), peer): ((u64, Request), SocketAddr)| {
             let mut buf = bytes::BytesMut::with_capacity(4096);
             let res = StunCodec::encode((id, req), &mut buf);
@@ -210,8 +207,7 @@ impl StunCodec {
         })
     }
 
-
-    pub fn decode_const(msg: &[u8]) -> Result<Option<(u64, Response)>> {
+    pub fn decode_const(expected_id: u64, msg: Vec<u8>) -> Result<Option<Response>> {
         let mut c = Cursor::new(msg);
 
         let msg_type = c.read_u16::<NetworkEndian>()?;
@@ -219,16 +215,21 @@ impl StunCodec {
         let trans_id1 = c.read_u64::<NetworkEndian>()?;
         let trans_id2 = c.read_u64::<NetworkEndian>()?;
 
-        if trans_id1 != 0 {
-            return Ok(None)/*
+        // The socket also receives data packets, if we do not verify this, we have no way of knowing it isn't a stun response.
+        // We try to parse all packets, and only some will pass this filter and the next one.
+        if trans_id2 != expected_id {
+            // Likely not a stun packet, specifically not a packet for us.
+            return Ok(None);
+        }
+        if trans_id1 != (MAGIC_COOKIE as u64) << 32 {
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 "Invalid transaction ID!",
-            ));*/
+            ));
         }
 
         let res = match msg_type {
-            BINDING_RESPONSE => StunCodec::read_binding_response(msg, &mut c).map(Response::Bind),
+            BINDING_RESPONSE => StunCodec::read_binding_response(&mut c).map(Response::Bind),
             BINDING_ERROR => Err(Error::new(
                 ErrorKind::InvalidData,
                 "BINDING_ERROR unimplemented",
@@ -244,16 +245,28 @@ impl StunCodec {
             _ => return Err(Error::new(ErrorKind::InvalidData, "Unknown message type!")),
         };
 
-        res.map(|v| Some((trans_id2, v)))
+        res.map(|v| Some(v))
     }
 }
 
 impl Attribute {
-    fn read(mut c: &mut Cursor<&[u8]>) -> Result<Attribute> {
+    fn read(mut c: &mut Cursor<Vec<u8>>) -> Result<Attribute> {
         let typ = c.read_u16::<NetworkEndian>()?;
         let len = c.read_u16::<NetworkEndian>()?;
 
         match typ {
+            XOR_MAPPED_ADDRESS => {
+                let pos = c.position() as usize + 2;
+                let buf = c.get_mut();
+                let mut xor_buf = [0u8; 18];
+                xor_buf[0..2].copy_from_slice(&((MAGIC_COOKIE >> 16) as u16).to_be_bytes());
+                xor_buf[2..18].copy_from_slice(&buf[4..20]);
+                let n = ((len - 2) as usize).min(xor_buf.len()).min(buf.len() - pos);
+                for i in 0..n {
+                    buf[pos + i] ^= xor_buf[i];
+                }
+                Ok(Attribute::MappedAddress(Self::read_address(&mut c)?))
+            }
             MAPPED_ADDRESS => Ok(Attribute::MappedAddress(Self::read_address(&mut c)?)),
             RESPONSE_ADDRESS => Ok(Attribute::ResponseAddress(Self::read_address(&mut c)?)),
             CHANGED_ADDRESS => Ok(Attribute::ChangedAddress(Self::read_address(&mut c)?)),
@@ -286,23 +299,32 @@ impl Attribute {
         }
     }
 
-    fn read_address(c: &mut Cursor<&[u8]>) -> Result<SocketAddr> {
+    fn read_address(c: &mut Cursor<Vec<u8>>) -> Result<SocketAddr> {
         let _ = c.read_u8()?;
         let typ = c.read_u8()?;
         let port = c.read_u16::<NetworkEndian>()?;
-        let addr = c.read_u32::<NetworkEndian>()?;
 
-        if typ != 0x01 {
-            return Err(Error::new(ErrorKind::InvalidData, "Invalid address family"));
+        match typ {
+            0x01 => {
+                let addr = c.read_u32::<NetworkEndian>()?;
+                let b0 = ((addr & 0xff00_0000) >> 24) as u8;
+                let b1 = ((addr & 0x00ff_0000) >> 16) as u8;
+                let b2 = ((addr & 0x0000_ff00) >> 8) as u8;
+                let b3 = (addr & 0x0000_00ff) as u8;
+                let ip = IpAddr::V4(Ipv4Addr::new(b0, b1, b2, b3));
+
+                Ok(SocketAddr::new(ip, port))
+            }
+            0x02 => {
+                // Change to read 16 bytes.
+                let mut out = [0u8; 16];
+                let addr = c.read_exact(&mut out)?;
+                let ip = IpAddr::V6(Ipv6Addr::from(out));
+
+                Ok(SocketAddr::new(ip, port))
+            }
+            _ => Err(Error::new(ErrorKind::InvalidData, "Invalid address family")),
         }
-
-        let b0 = ((addr & 0xff00_0000) >> 24) as u8;
-        let b1 = ((addr & 0x00ff_0000) >> 16) as u8;
-        let b2 = ((addr & 0x0000_ff00) >> 8) as u8;
-        let b3 = (addr & 0x0000_00ff) as u8;
-        let ip = IpAddr::V4(Ipv4Addr::new(b0, b1, b2, b3));
-
-        Ok(SocketAddr::new(ip, port))
     }
 
     fn encode(&self, buf: &mut Vec<u8>) -> Result<()> {
@@ -379,6 +401,7 @@ const SHARED_SECRET_RESPONSE: u16 = 0x0102;
 const SHARED_SECRET_ERROR: u16 = 0x0112;
 
 const MAPPED_ADDRESS: u16 = 0x0001;
+const XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const RESPONSE_ADDRESS: u16 = 0x0002;
 const CHANGE_REQUEST: u16 = 0x0003;
 const SOURCE_ADDRESS: u16 = 0x0004;
@@ -437,13 +460,13 @@ mod tests {
             0x66, 0x6f, 0x6f,
             0x00, //  "foo"
 
-            /*0x00, 0x08, 0x00, 0x14, // message integrity
-            0x89, 0x4f, 0xef, 0x24, //  sha1
-            0xd5, 0x81, 0x45, 0x66, //  ...
-            0x8b, 0xa8, 0x27, 0xf0, //  ...
-            0xf8, 0x1e, 0x54, 0x98, //  ...
-            0xf7, 0x19, 0x52, 0x04, //  ...
-            */
+                  /*0x00, 0x08, 0x00, 0x14, // message integrity
+                  0x89, 0x4f, 0xef, 0x24, //  sha1
+                  0xd5, 0x81, 0x45, 0x66, //  ...
+                  0x8b, 0xa8, 0x27, 0xf0, //  ...
+                  0xf8, 0x1e, 0x54, 0x98, //  ...
+                  0xf7, 0x19, 0x52, 0x04, //  ...
+                  */
         ];
 
         assert_eq!(expected, actual);

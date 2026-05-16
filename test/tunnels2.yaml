@@ -1,0 +1,6 @@
+# public_key: "Qlfsb08uHmhqLgPUKnn4OooxCqIm+DnAsqA116nlCxM="
+secret_key: "8RgMh7rfXg6ptGnWiDuiRrP55Aom0bmOzaaWkXb6Yws="
+peers:
+  - name: "tunnels1_peer"
+    local_port: 10002
+    public_key: "81jls/NwG8yuvV0AFQOHGtj3/olvwSUaoQ3He3bnuzU="

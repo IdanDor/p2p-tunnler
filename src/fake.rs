@@ -1,15 +1,15 @@
 use std::net::SocketAddr;
 
-use async_trait::async_trait;
 use async_std::prelude::*;
+use async_trait::async_trait;
 
+use crate::api::*;
+use crate::stun;
+use crate::utils::UdpReceiver;
+use crate::utils::UdpSender;
 use crate::PublicKey;
 use crate::SecretKey;
-use crate::api::*;
 use crate::WireguardDevice;
-use crate::stun;
-use crate::utils::UdpSender;
-use crate::utils::UdpReceiver;
 
 pub struct Cfg;
 
@@ -23,11 +23,10 @@ impl Cfg {
 
 #[async_trait]
 impl ConfigApi for Cfg {
-    fn get_wireguard_devices(&self) -> anyhow::Result<Box<dyn Stream<Item=(Box<dyn WireguardDevice>, DeviceConfig)> + Unpin>> {
-        unimplemented!()
-    }
-
-    async fn get_peers(&self, dev: &dyn WireguardDevice) -> anyhow::Result<Box<dyn Stream<Item=Box<dyn Peer>> + Unpin>> {
+    fn get_wireguard_devices(
+        &self,
+    ) -> anyhow::Result<Box<dyn Stream<Item = (Box<dyn WireguardDevice>, DeviceConfig)> + Unpin>>
+    {
         unimplemented!()
     }
 }
@@ -44,7 +43,7 @@ impl FakeDht {
 
 #[async_trait]
 impl DhtApi for FakeDht {
-    fn listen(&self, key: Vec<u8>) -> Box<dyn Stream<Item=Vec<u8>> + Send + Unpin> {
+    fn listen(&self, key: Vec<u8>) -> Box<dyn Stream<Item = Vec<u8>> + Send + Unpin> {
         unimplemented!()
     }
 
@@ -58,10 +57,13 @@ pub struct FakeStun;
 #[async_trait]
 impl Stun for FakeStun {
     // return not just SocketAddr but also stun state type
-    async fn lookup_public_address(&self, stun_log: &slog::Logger,
-                                   to_inet_tx: &mut UdpSender,
-                                   from_inet_rx: &mut UdpReceiver,
-                                   stun_server: SocketAddr) -> anyhow::Result<stun::Connectivity> {
+    async fn lookup_public_address(
+        &self,
+        stun_log: &slog::Logger,
+        to_inet_tx: &mut UdpSender,
+        from_inet_rx: &mut UdpReceiver,
+        stun_server: SocketAddr,
+    ) -> anyhow::Result<stun::Connectivity> {
         todo!()
     }
 }
@@ -74,7 +76,11 @@ impl WireguardDevice for FakeWireguardDevice {
         return Ok(9999);
     }
 
-    async fn set_endpoint(&self, remote_pkey: &PublicKey, remote_addr: &SocketAddr) -> anyhow::Result<()> {
+    async fn set_endpoint(
+        &self,
+        remote_pkey: &PublicKey,
+        remote_addr: &SocketAddr,
+    ) -> anyhow::Result<()> {
         unimplemented!()
     }
 
@@ -90,7 +96,7 @@ impl WireguardDevice for FakeWireguardDevice {
         unimplemented!()
     }
 
-    async fn get_peers(&self) -> anyhow::Result<Box<dyn Stream<Item=Box<dyn Peer>> + Unpin>>  {
+    async fn get_peers(&self) -> anyhow::Result<Box<dyn Stream<Item = Box<dyn Peer>> + Unpin>> {
         unimplemented!()
     }
 }

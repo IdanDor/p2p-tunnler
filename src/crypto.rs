@@ -3,11 +3,18 @@ use crate::api::PublicKeyCrypto;
 use sodiumoxide::crypto::box_;
 use sodiumoxide::crypto::box_::NONCEBYTES;
 
+use std::convert::TryFrom;
+
+use base64::{engine::general_purpose, Engine};
+
+use anyhow::{anyhow, Result};
+
 use base64;
 use bytes::BufMut;
 
 #[derive(Clone)]
 pub struct PublicKey(pub box_::PublicKey);
+#[derive(Clone)]
 pub struct SecretKey(pub box_::SecretKey);
 
 pub struct Sodiumoxide(box_::PrecomputedKey);
@@ -17,6 +24,19 @@ impl Sodiumoxide {
         let precomputed_key = box_::precompute(&their_pk.0, &our_sk.0);
         Self(precomputed_key)
     }
+}
+
+pub fn generate_secret_key_base64() -> (SecretKey, String, PublicKey) {
+    // Initialize sodiumoxide
+    sodiumoxide::init().expect("Failed to initialize sodiumoxide");
+
+    // Generate key pair
+    let (pk, sk) = box_::gen_keypair();
+
+    let display = general_purpose::STANDARD.encode(&sk.0);
+
+    // Convert secret key to Base64
+    (SecretKey(sk), display, PublicKey(pk))
 }
 
 impl PublicKeyCrypto for Sodiumoxide {
@@ -57,9 +77,29 @@ impl PublicKey {
     }
 }
 
+impl TryFrom<&str> for PublicKey {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        // Decode Base64
+        let bytes = general_purpose::STANDARD
+            .decode(&value)
+            .map_err(|e| anyhow!("Base64 decode error: {}", e))?;
+
+        if bytes.len() != 32 {
+            return Err(anyhow!("Invalid length: expected 32, got {}", bytes.len()));
+        }
+
+        // Convert Vec<u8> -> [u8; 32], panic on bad length
+        let mut array = [0u8; 32];
+        array.copy_from_slice(&bytes);
+        Ok(PublicKey::new(array))
+    }
+}
+
 impl std::fmt::Display for PublicKey {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(fmt, "{}", base64::encode(self.0.0))
+        write!(fmt, "{}", base64::encode(self.0 .0))
     }
 }
 
@@ -70,5 +110,25 @@ impl SecretKey {
 
     pub fn public_key(&self) -> PublicKey {
         PublicKey(self.0.public_key())
+    }
+}
+
+impl TryFrom<&str> for SecretKey {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        // Decode Base64
+        let bytes = general_purpose::STANDARD
+            .decode(&value)
+            .map_err(|e| anyhow!("Base64 decode error: {}", e))?;
+
+        if bytes.len() != 32 {
+            return Err(anyhow!("Invalid length: expected 32, got {}", bytes.len()));
+        }
+
+        // Convert Vec<u8> -> [u8; 32], panic on bad length
+        let mut array = [0u8; 32];
+        array.copy_from_slice(&bytes);
+        Ok(SecretKey::new(array))
     }
 }

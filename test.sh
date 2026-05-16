@@ -1,8 +1,10 @@
 #!/bin/bash
 
-set -v
+# Run this as sudo, after running:
+# cargo run -- run tunnels.yaml
+# cargo run -- run test/tunnels2.yaml -P 4223
 
-# First we create the network namespace called "container":
+set -v
 
 ip netns delete ns1
 ip netns delete ns2
@@ -10,38 +12,23 @@ ip netns delete ns2
 ip netns add ns1
 ip netns add ns2
 
-# Next, we create a WireGuard interface in the "init" (original) namespace:
+ip link add wg1 type wireguard
+ip link add wg2 type wireguard
 
-# Finally, we move that interface into the new namespace:
+wg setconf wg1 test/wg1.conf
+wg setconf wg2 test/wg2.conf
 
-# Now we can configure wg0 as usual, except we specify its new namespace in doing so:
+ip link set wg1 netns ns1
+ip link set wg2 netns ns2
 
-    ip link delete test1
-    ip link delete test2
+ip -n ns1 addr add 10.0.0.1/24 dev wg1
+ip -n ns2 addr add 10.0.0.2/24 dev wg2
 
-ip link add test1 type wireguard
-ip link add test2 type wireguard
+ip -n ns1 link set wg1 up
+ip -n ns2 link set wg2 up
 
-ip link set test1 netns ns1
-ip link set test2 netns ns2
+ip -n ns1 route add 10.0.0.2/24 via 10.0.0.1 dev wg1
+ip -n ns2 route add 10.0.0.1/24 via 10.0.0.2 dev wg2
 
-ip -n ns1 addr add 10.9.9.1/32 dev test1
-ip -n ns2 addr add 10.9.9.2/32 dev test2
-
-ip netns exec ns1 wg setconf test1 /etc/wireguard/test1.conf
-ip netns exec ns2 wg setconf test2 /etc/wireguard/test2.conf
-#ip netns exec ns1 wg-quick up test1
-#ip netns exec ns2 wg-quick up test2
-
-ip -n ns1 link set test1 up
-ip -n ns2 link set test2 up
-
-ip -n ns1 route add default dev test1
-ip -n ns2 route add default dev test2
-
-ip netns exec ns1 wg set test1 peer g912ZZMQB0REuA7brLYumd0VQS2/J/8odv7LYSm+cw0= endpoint 192.168.178.21:9991
-
-sleep 2
-
-ip netns exec ns1 wg
-ip netns exec ns1 ping 10.9.9.2
+ip netns exec ns1 wg show
+ip netns exec ns1 ping 10.0.0.2

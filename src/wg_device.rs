@@ -7,9 +7,9 @@ use async_std::sync::Mutex;
 use wireguard_uapi::{DeviceInterface, WgSocket};
 
 use crate::api;
-use crate::WireguardDevice;
 use crate::PublicKey;
 use crate::SecretKey;
+use crate::WireguardDevice;
 
 #[allow(dead_code)]
 pub struct WireguardDev {
@@ -25,7 +25,8 @@ impl WireguardDev {
         let ifindex = dev.ifindex;
 
         Ok(WireguardDev {
-            ifindex, ifname,
+            ifindex,
+            ifname,
             socket: Arc::new(Mutex::new(socket)),
         })
     }
@@ -49,34 +50,59 @@ impl WireguardDevice for WireguardDev {
         return Ok(dev.listen_port);
     }
 
-    async fn set_endpoint(&self, remote_pkey: &PublicKey, remote_addr: &SocketAddr) -> anyhow::Result<()> {
+    async fn set_endpoint(
+        &self,
+        remote_pkey: &PublicKey,
+        remote_addr: &SocketAddr,
+    ) -> anyhow::Result<()> {
         let dev = self.get_device().await?;
-        let peer = dev.peers.iter().filter(|p| p.public_key.eq(&remote_pkey.0.0)).next();
+        let peer = dev
+            .peers
+            .iter()
+            .filter(|p| p.public_key.eq(&remote_pkey.0 .0))
+            .next();
         if let Some(peer) = peer {
             let peer = wireguard_uapi::set::Peer {
                 public_key: &peer.public_key,
                 flags: Vec::new(),
                 preshared_key: Some(&peer.preshared_key),
                 endpoint: Some(&remote_addr),
-                persistent_keepalive_interval: if peer.persistent_keepalive_interval == 0 { None } else { Some(peer.persistent_keepalive_interval) },
+                persistent_keepalive_interval: if peer.persistent_keepalive_interval == 0 {
+                    None
+                } else {
+                    Some(peer.persistent_keepalive_interval)
+                },
                 allowed_ips: Vec::new(),
-                protocol_version: if peer.protocol_version == 0 { None } else { Some(peer.protocol_version) },
+                protocol_version: if peer.protocol_version == 0 {
+                    None
+                } else {
+                    Some(peer.protocol_version)
+                },
             };
 
             let dev = wireguard_uapi::set::Device {
                 interface: DeviceInterface::from_index(self.ifindex),
                 flags: Vec::new(),
                 private_key: dev.private_key.as_ref(),
-                listen_port: if dev.listen_port == 0 { None } else { Some(dev.listen_port) },
+                listen_port: if dev.listen_port == 0 {
+                    None
+                } else {
+                    Some(dev.listen_port)
+                },
                 fwmark: Some(dev.fwmark),
-                peers: vec!(peer)
+                peers: vec![peer],
             };
 
             let mut sock = self.socket.lock().await;
             sock.set_device(dev)?;
             Ok(())
         } else {
-            Err(anyhow!("Failed to find peer {} for wireguard device {} ({})", remote_pkey, self.ifname, self.ifindex))
+            Err(anyhow!(
+                "Failed to find peer {} for wireguard device {} ({})",
+                remote_pkey,
+                self.ifname,
+                self.ifindex
+            ))
         }
     }
 
@@ -97,9 +123,12 @@ impl WireguardDevice for WireguardDev {
         return Ok(skey);
     }
 
-    async fn get_peers(&self) -> anyhow::Result<Box<dyn Stream<Item=Box<dyn api::Peer>> + Unpin>> {
+    async fn get_peers(
+        &self,
+    ) -> anyhow::Result<Box<dyn Stream<Item = Box<dyn api::Peer>> + Unpin>> {
         let dev = self.get_device().await?;
-        let vec: Vec<Box<dyn api::Peer>> = dev.peers.into_iter().map(|p| Peer(p).as_trait()).collect();
+        let vec: Vec<Box<dyn api::Peer>> =
+            dev.peers.into_iter().map(|p| Peer(p).as_trait()).collect();
         let stream = futures::stream::iter(vec.into_iter());
         Ok(Box::new(stream))
     }

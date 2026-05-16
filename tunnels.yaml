@@ -1,0 +1,5 @@
+# public_key: "81jls/NwG8yuvV0AFQOHGtj3/olvwSUaoQ3He3bnuzU="
+secret_key: "gAuMqtAqs6SlOHsV/amRGvT6VGRYFJAB6o973BKmDIo="
+peers:
+  - local_port: 10001
+    public_key: "Qlfsb08uHmhqLgPUKnn4OooxCqIm+DnAsqA116nlCxM="
