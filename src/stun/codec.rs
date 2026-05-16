@@ -14,9 +14,6 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use futures::Sink;
 use futures::SinkExt;
-use futures::Stream;
-use futures::StreamExt;
-use futures::TryStream;
 
 use byteorder::NetworkEndian;
 use byteorder::ReadBytesExt;
@@ -33,18 +30,13 @@ pub enum Request {
     SharedSecret, //(SharedSecretRequestMsg),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum ChangeRequest {
+    #[default]
     None,
     Ip,
     Port,
     IpAndPort,
-}
-
-impl Default for ChangeRequest {
-    fn default() -> Self {
-        ChangeRequest::None
-    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -245,12 +237,12 @@ impl StunCodec {
             _ => return Err(Error::new(ErrorKind::InvalidData, "Unknown message type!")),
         };
 
-        res.map(|v| Some(v))
+        res.map(Some)
     }
 }
 
 impl Attribute {
-    fn read(mut c: &mut Cursor<Vec<u8>>) -> Result<Attribute> {
+    fn read(c: &mut Cursor<Vec<u8>>) -> Result<Attribute> {
         let typ = c.read_u16::<NetworkEndian>()?;
         let len = c.read_u16::<NetworkEndian>()?;
 
@@ -265,13 +257,13 @@ impl Attribute {
                 for i in 0..n {
                     buf[pos + i] ^= xor_buf[i];
                 }
-                Ok(Attribute::MappedAddress(Self::read_address(&mut c)?))
+                Ok(Attribute::MappedAddress(Self::read_address(c)?))
             }
-            MAPPED_ADDRESS => Ok(Attribute::MappedAddress(Self::read_address(&mut c)?)),
-            RESPONSE_ADDRESS => Ok(Attribute::ResponseAddress(Self::read_address(&mut c)?)),
-            CHANGED_ADDRESS => Ok(Attribute::ChangedAddress(Self::read_address(&mut c)?)),
-            SOURCE_ADDRESS => Ok(Attribute::SourceAddress(Self::read_address(&mut c)?)),
-            REFLECTED_FROM => Ok(Attribute::ReflectedFrom(Self::read_address(&mut c)?)),
+            MAPPED_ADDRESS => Ok(Attribute::MappedAddress(Self::read_address(c)?)),
+            RESPONSE_ADDRESS => Ok(Attribute::ResponseAddress(Self::read_address(c)?)),
+            CHANGED_ADDRESS => Ok(Attribute::ChangedAddress(Self::read_address(c)?)),
+            SOURCE_ADDRESS => Ok(Attribute::SourceAddress(Self::read_address(c)?)),
+            REFLECTED_FROM => Ok(Attribute::ReflectedFrom(Self::read_address(c)?)),
             MESSAGE_INTEGRITY => {
                 let mut hash = [0; 20];
                 c.read_exact(&mut hash)?;
@@ -318,7 +310,7 @@ impl Attribute {
             0x02 => {
                 // Change to read 16 bytes.
                 let mut out = [0u8; 16];
-                let addr = c.read_exact(&mut out)?;
+                c.read_exact(&mut out)?;
                 let ip = IpAddr::V6(Ipv6Addr::from(out));
 
                 Ok(SocketAddr::new(ip, port))

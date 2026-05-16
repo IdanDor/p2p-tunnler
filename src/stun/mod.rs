@@ -36,9 +36,9 @@ pub enum Connectivity {
     SymmetricFirewall(SocketAddr),
 }
 
-impl Into<Option<SocketAddr>> for Connectivity {
-    fn into(self) -> Option<SocketAddr> {
-        match self {
+impl From<Connectivity> for Option<SocketAddr> {
+    fn from(val: Connectivity) -> Self {
+        match val {
             Connectivity::OpenInternet(addr) => Some(addr),
             Connectivity::FullConeNat(addr) => Some(addr),
             Connectivity::SymmetricNat => None,
@@ -51,42 +51,28 @@ impl Into<Option<SocketAddr>> for Connectivity {
 
 pub struct Stun;
 
-#[async_trait::async_trait]
-impl crate::api::Stun for Stun {
-    async fn lookup_public_address(
+impl Stun {
+    pub async fn lookup_public_address(
         &self,
         stun_log: &slog::Logger,
-        mut to_inet_tx: &mut UdpSender,
-        mut from_inet_rx: &mut UdpReceiver,
+        to_inet_tx: &mut UdpSender,
+        from_inet_rx: &mut UdpReceiver,
         stun_server: SocketAddr,
     ) -> anyhow::Result<Connectivity> {
         let bind_addr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-        let conn = check(
-            stun_log,
-            &mut to_inet_tx,
-            &mut from_inet_rx,
-            bind_addr,
-            stun_server,
-        )
-        .await?;
+        let conn = check(stun_log, to_inet_tx, from_inet_rx, bind_addr, stun_server).await?;
         Ok(conn)
     }
 }
 
 async fn check(
     stun_log: &slog::Logger,
-    mut to_inet_tx: &mut UdpSender,
-    mut from_inet_rx: &mut UdpReceiver,
+    to_inet_tx: &mut UdpSender,
+    from_inet_rx: &mut UdpReceiver,
     bind_addr: IpAddr,
     stun_server: SocketAddr,
 ) -> Result<Connectivity, anyhow::Error> {
-    let resp = change_request(
-        &mut to_inet_tx,
-        &mut from_inet_rx,
-        stun_server,
-        ChangeRequest::None,
-    )
-    .await?;
+    let resp = change_request(to_inet_tx, from_inet_rx, stun_server, ChangeRequest::None).await?;
     if let Some(Response::Bind(resp)) = resp {
         let public_addr = resp.mapped_address;
 
@@ -98,8 +84,8 @@ async fn check(
                 public_addr.ip()
             );
             let resp = change_request(
-                &mut to_inet_tx,
-                &mut from_inet_rx,
+                to_inet_tx,
+                from_inet_rx,
                 stun_server,
                 ChangeRequest::IpAndPort,
             )
@@ -121,8 +107,8 @@ async fn check(
 
         // NAT detected
         let resp = change_request(
-            &mut to_inet_tx,
-            &mut from_inet_rx,
+            to_inet_tx,
+            from_inet_rx,
             stun_server,
             ChangeRequest::IpAndPort,
         )
@@ -133,26 +119,16 @@ async fn check(
         }
 
         debug!(stun_log, "No respone from different IP and Port");
-        let resp = change_request(
-            &mut to_inet_tx,
-            &mut from_inet_rx,
-            stun_server,
-            ChangeRequest::Port,
-        )
-        .await?;
+        let resp =
+            change_request(to_inet_tx, from_inet_rx, stun_server, ChangeRequest::Port).await?;
         if let Some(Response::Bind(resp)) = resp {
             if resp.mapped_address.ip() != public_addr.ip() {
                 info!(stun_log, "SymmetricNat");
                 return Ok(Connectivity::SymmetricNat);
             }
 
-            let resp = change_request(
-                &mut to_inet_tx,
-                &mut from_inet_rx,
-                stun_server,
-                ChangeRequest::Port,
-            )
-            .await?;
+            let resp =
+                change_request(to_inet_tx, from_inet_rx, stun_server, ChangeRequest::Port).await?;
             if resp.is_some() {
                 info!(stun_log, "RestrictedConeNat: {}", public_addr);
                 Ok(Connectivity::RestrictedConeNat(public_addr))
@@ -161,13 +137,13 @@ async fn check(
                 Ok(Connectivity::RestrictedPortNat(public_addr))
             }
         } else {
-            let msg = format!("Expected Some(BindResponse) but got {:?} instead!", resp);
-            todo!()
-            //Err(std::io::Error::new(ErrorKind::InvalidData, msg))
+            Err(anyhow!(
+                "Expected Some(BindResponse) but got {:?} instead!",
+                resp
+            ))
         }
     } else {
-        todo!()
-        //        Err(std::io::Error::from_raw_os_error(NETWORK_UNREACHABLE))
+        Err(anyhow!("Network unreachable"))
     }
 }
 
@@ -196,7 +172,7 @@ async fn send_request(
     // try 10 attempts before giving up.
     for _i in 0..10 {
         let mut lock = RNG.lock().await;
-        let id: u64 = lock.gen();
+        let id: u64 = lock.r#gen();
         StunCodec::encode((id, req.clone()), &mut buf)?;
         to_inet_tx.send((buf.to_vec(), stun_server)).await?;
 
@@ -206,9 +182,9 @@ async fn send_request(
             let dur = Duration::from_secs(10).checked_sub(Instant::now() - start);
             let dur = dur.unwrap_or(Duration::from_secs(0));
             match async_std::future::timeout(dur, from_inet_rx.next()).await {
-                Err(e) => break,
+                Err(_e) => break,
                 Ok(None) => break,
-                Ok(Some((buf, src))) => {
+                Ok(Some((buf, _src))) => {
                     let buf = buf.into_iter().collect();
                     if let Some(resp) = StunCodec::decode_const(id, buf)? {
                         return Ok(Some(resp));

@@ -1,15 +1,12 @@
-use crate::api::PublicKeyCrypto;
-
 use sodiumoxide::crypto::box_;
 use sodiumoxide::crypto::box_::NONCEBYTES;
 
 use std::convert::TryFrom;
 
-use base64::{engine::general_purpose, Engine};
+use base64::engine::{Engine, general_purpose};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
-use base64;
 use bytes::BufMut;
 
 #[derive(Clone)]
@@ -39,8 +36,8 @@ pub fn generate_secret_key_base64() -> (SecretKey, String, PublicKey) {
     (SecretKey(sk), display, PublicKey(pk))
 }
 
-impl PublicKeyCrypto for Sodiumoxide {
-    fn encrypt(&self, plaintext: &[u8]) -> anyhow::Result<bytes::Bytes> {
+impl Sodiumoxide {
+    pub fn encrypt(&self, plaintext: &[u8]) -> anyhow::Result<bytes::Bytes> {
         let nonce = box_::gen_nonce();
 
         let ciphertext = box_::seal_precomputed(plaintext, &nonce, &self.0);
@@ -49,18 +46,18 @@ impl PublicKeyCrypto for Sodiumoxide {
         buf.put(&nonce.0[..]);
         buf.put(&ciphertext[..]);
 
-        return Ok(buf.freeze());
+        Ok(buf.freeze())
     }
 
-    fn decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
+    pub fn decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
         if ciphertext.len() < NONCEBYTES {
             dbg!("Decryption failed");
             return None;
         }
         let (nonce, ciphertext) = ciphertext.split_at(NONCEBYTES);
 
-        if let Some(nonce) = box_::Nonce::from_slice(&nonce[..]) {
-            let r = box_::open_precomputed(&ciphertext, &nonce, &self.0);
+        if let Some(nonce) = box_::Nonce::from_slice(nonce) {
+            let r = box_::open_precomputed(ciphertext, &nonce, &self.0);
             if r.is_err() {
                 dbg!("Decryption failed");
             }
@@ -83,7 +80,7 @@ impl TryFrom<&str> for PublicKey {
     fn try_from(value: &str) -> Result<Self> {
         // Decode Base64
         let bytes = general_purpose::STANDARD
-            .decode(&value)
+            .decode(value)
             .map_err(|e| anyhow!("Base64 decode error: {}", e))?;
 
         if bytes.len() != 32 {
@@ -99,7 +96,7 @@ impl TryFrom<&str> for PublicKey {
 
 impl std::fmt::Display for PublicKey {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(fmt, "{}", base64::encode(self.0 .0))
+        write!(fmt, "{}", general_purpose::STANDARD.encode(self.0.0))
     }
 }
 
@@ -119,7 +116,7 @@ impl TryFrom<&str> for SecretKey {
     fn try_from(value: &str) -> Result<Self> {
         // Decode Base64
         let bytes = general_purpose::STANDARD
-            .decode(&value)
+            .decode(value)
             .map_err(|e| anyhow!("Base64 decode error: {}", e))?;
 
         if bytes.len() != 32 {
