@@ -72,7 +72,14 @@ async fn check(
     bind_addr: IpAddr,
     stun_server: SocketAddr,
 ) -> Result<Connectivity, anyhow::Error> {
-    let resp = change_request(to_inet_tx, from_inet_rx, stun_server, ChangeRequest::None).await?;
+    let resp = change_request(
+        stun_log,
+        to_inet_tx,
+        from_inet_rx,
+        stun_server,
+        ChangeRequest::None,
+    )
+    .await?;
     if let Some(Response::Bind(resp)) = resp {
         let public_addr = resp.mapped_address;
 
@@ -84,6 +91,7 @@ async fn check(
                 public_addr.ip()
             );
             let resp = change_request(
+                stun_log,
                 to_inet_tx,
                 from_inet_rx,
                 stun_server,
@@ -107,6 +115,7 @@ async fn check(
 
         // NAT detected
         let resp = change_request(
+            stun_log,
             to_inet_tx,
             from_inet_rx,
             stun_server,
@@ -119,16 +128,28 @@ async fn check(
         }
 
         debug!(stun_log, "No respone from different IP and Port");
-        let resp =
-            change_request(to_inet_tx, from_inet_rx, stun_server, ChangeRequest::Port).await?;
+        let resp = change_request(
+            stun_log,
+            to_inet_tx,
+            from_inet_rx,
+            stun_server,
+            ChangeRequest::Port,
+        )
+        .await?;
         if let Some(Response::Bind(resp)) = resp {
             if resp.mapped_address.ip() != public_addr.ip() {
                 info!(stun_log, "SymmetricNat");
                 return Ok(Connectivity::SymmetricNat);
             }
 
-            let resp =
-                change_request(to_inet_tx, from_inet_rx, stun_server, ChangeRequest::Port).await?;
+            let resp = change_request(
+                stun_log,
+                to_inet_tx,
+                from_inet_rx,
+                stun_server,
+                ChangeRequest::Port,
+            )
+            .await?;
             if resp.is_some() {
                 info!(stun_log, "RestrictedConeNat: {}", public_addr);
                 Ok(Connectivity::RestrictedConeNat(public_addr))
@@ -148,6 +169,7 @@ async fn check(
 }
 
 async fn change_request(
+    stun_log: &slog::Logger,
     to_inet_tx: &mut UdpSender,
     from_inet_rx: &mut UdpReceiver,
     stun_server: SocketAddr,
@@ -158,43 +180,48 @@ async fn change_request(
         ..Default::default()
     });
 
-    send_request(to_inet_tx, from_inet_rx, stun_server, req).await
+    send_request(stun_log, to_inet_tx, from_inet_rx, stun_server, req).await
 }
 
 async fn send_request(
+    stun_log: &slog::Logger,
     to_inet_tx: &mut UdpSender,
     from_inet_rx: &mut UdpReceiver,
     stun_server: SocketAddr,
     req: Request,
 ) -> Result<Option<Response>, anyhow::Error> {
+    let mut lock = RNG.lock().await;
+    let id: u64 = lock.r#gen();
+
     let mut buf = bytes::BytesMut::new();
+    StunCodec::encode((id, req.clone()), &mut buf)?;
+    to_inet_tx.send((buf.to_vec(), stun_server)).await?;
 
-    // try 10 attempts before giving up.
-    for _i in 0..10 {
-        let mut lock = RNG.lock().await;
-        let id: u64 = lock.r#gen();
-        StunCodec::encode((id, req.clone()), &mut buf)?;
-        to_inet_tx.send((buf.to_vec(), stun_server)).await?;
+    let start = Instant::now();
 
-        let start = Instant::now();
-
-        loop {
-            let dur = Duration::from_secs(10).checked_sub(Instant::now() - start);
-            let dur = dur.unwrap_or(Duration::from_secs(0));
-            match async_std::future::timeout(dur, from_inet_rx.next()).await {
-                Err(_e) => break,
-                Ok(None) => break,
-                Ok(Some((buf, _src))) => {
-                    let buf = buf.into_iter().collect();
-                    if let Some(resp) = StunCodec::decode_const(id, buf)? {
-                        return Ok(Some(resp));
-                    } else {
-                        continue;
-                    }
+    loop {
+        let dur = Duration::from_secs(3).checked_sub(Instant::now() - start);
+        let dur = dur.unwrap_or(Duration::from_secs(0));
+        match async_std::future::timeout(dur, from_inet_rx.next()).await {
+            Err(e) => {
+                debug!(stun_log, "Error getting inet stun packet {:?}", e);
+                break;
+            }
+            Ok(None) => {
+                debug!(stun_log, "Stun did not get a packet, got Ok(None)");
+                break;
+            }
+            Ok(Some((buf, _src))) => {
+                let buf = buf.into_iter().collect();
+                debug!(stun_log, "Got packet for stun {:?}", buf);
+                if let Some(resp) = StunCodec::decode_const(id, buf)? {
+                    return Ok(Some(resp));
+                } else {
+                    continue;
                 }
             }
         }
     }
 
-    Err(anyhow!("Failed to get response, after 10 attempts"))
+    Err(anyhow!("Failed to get stun response"))
 }

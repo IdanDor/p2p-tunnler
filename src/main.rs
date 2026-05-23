@@ -15,11 +15,10 @@ use std::convert::{TryFrom, TryInto};
 
 use anyhow::{Context, anyhow, bail};
 use async_broadcast::{Receiver, RecvError, Sender, broadcast};
-use async_std::net::ToSocketAddrs;
-use async_std::net::UdpSocket;
+use async_std::net::{IpAddr, ToSocketAddrs, UdpSocket};
 use async_std::sync::RwLock;
 
-use slog::Drain;
+use slog::{Drain, Level, LevelFilter};
 use slog::{crit, debug, error, info};
 
 use base64::{Engine, engine::general_purpose};
@@ -50,7 +49,7 @@ async fn new_local_socket(
     lo_port: u16,
     remote_peer_addrs: Arc<RwAddrConnections>,
 ) -> anyhow::Result<Arc<RwLocalAddr>> {
-    info!(parent_log, "Setting up new local address"; slog::o!("local_port" => lo_port));
+    info!(parent_log, "Setting up new local address"; "local_port" => lo_port);
 
     let lo_sock = create_local_receiever(lo_port).await?;
     let local_addr = lo_sock.local_addr()?;
@@ -68,7 +67,7 @@ async fn new_local_socket(
             let n = buf.len();
 
             if local_addr_rw.read().await.1 != Some(lo_peer_addr) {
-                info!(log_out, "lo_peer_addr changed, it is now..."; slog::o!("lo_peer_addr" => lo_peer_addr));
+                info!(log_out, "lo_peer_addr changed, it is now..."; "lo_peer_addr" => lo_peer_addr);
                 local_addr_rw.write().await.1 = Some(lo_peer_addr);
             }
 
@@ -77,7 +76,7 @@ async fn new_local_socket(
                 // lo_peer_addr must be wireguard on localhost
                 // to_inet_tx.send((buf[..n].to_vec(), *remote_peer_addr)).await?;
                 to_inet_tx.send((buf.to_vec(), *remote_peer_addr)).await?;
-                debug!(log_out, "Outbound packet forwarded"; slog::o!("src" => lo_peer_addr, "via_lo" => local_addr, "dst" => remote_peer_addr, "bytes" => n));
+                debug!(log_out, "Outbound packet forwarded"; "src" => lo_peer_addr, "via_lo" => local_addr, "dst" => remote_peer_addr, "bytes" => n);
             }
         }
     });
@@ -97,7 +96,7 @@ async fn dht_get(
     let crypto = Sodiumoxide::new(&remote_pkey, &secret_key);
 
     let key = [remote_pkey.0.0, local_pkey.0.0].concat();
-    debug!(log_get, "Waiting for remote peer to publish IP in DHT..."; slog::o!("dht_key" => general_purpose::STANDARD.encode(&key)));
+    debug!(log_get, "Waiting for remote peer to publish IP in DHT..."; "dht_key" => general_purpose::STANDARD.encode(&key));
 
     // TODO: if not found within X seconds, repeat
 
@@ -146,9 +145,9 @@ async fn dht_get(
                 .map(|d| d.as_secs())
                 .ok()
         });
-        debug!(log_get, "msg_ts < last_ts?"; slog::o!("msg_ts" => a, "last_ts" => b));
+        debug!(log_get, "msg_ts < last_ts?"; "msg_ts" => a, "last_ts" => b);
         if msg.as_ref().map(|m| m.timestamp) < last_timestamp {
-            debug!(log_get, "skipping"; slog::o!("msg_ts" => a, "last_ts" => b));
+            debug!(log_get, "skipping"; "msg_ts" => a, "last_ts" => b);
             continue;
         }
         last_timestamp = msg.as_ref().map(|m| m.timestamp);
@@ -165,18 +164,18 @@ async fn dht_get(
         let known_connections = connections.read().await;
         for remote_peer_addr in known_connections.difference(&new_set) {
             need_write = true;
-            info!(log_get, "Known peer address will no longer be used, not found in DHT"; slog::o!("addr" => remote_peer_addr));
+            info!(log_get, "Known peer address will no longer be used, not found in DHT"; "addr" => remote_peer_addr);
         }
         for remote_peer_addr in new_set.difference(&known_connections) {
             need_write = true;
-            info!(log_get, "New peer address found"; slog::o!("addr" => remote_peer_addr));
+            info!(log_get, "New peer address found"; "addr" => remote_peer_addr);
         }
         drop(known_connections);
         if need_write {
             *connections.write().await = new_set;
         }
 
-        debug!(log_get, "Waiting for remote peer to publish a new IP in DHT..."; slog::o!("dht_key" => general_purpose::STANDARD.encode(&key)));
+        debug!(log_get, "Waiting for remote peer to publish a new IP in DHT..."; "dht_key" => general_purpose::STANDARD.encode(&key));
     }
 
     Ok(())
@@ -187,20 +186,20 @@ async fn dht_put(
     dht: OpenDht,
     private_key: SecretKey,
     remote_pkey: PublicKey,
-    mut public_address_r: Receiver<Option<SocketAddr>>,
+    mut public_address_r: Receiver<Vec<SocketAddr>>,
 ) -> anyhow::Result<()> {
     let secret_key = private_key;
     let local_pkey = secret_key.public_key();
     let crypto = Sodiumoxide::new(&remote_pkey, &secret_key);
 
     let key = [local_pkey.0.0, remote_pkey.0.0].concat();
-    info!(log_put, "Will publish own public address on DHT"; slog::o!("dht_key" => general_purpose::STANDARD.encode(&key)));
+    info!(log_put, "Will publish own public address on DHT"; "dht_key" => general_purpose::STANDARD.encode(&key));
 
     debug!(log_put, "Starting to wait for new public address");
 
     loop {
-        let public_addr: Option<SocketAddr> = match public_address_r.recv().await {
-            Ok(addr) => addr,
+        let public_addrs: Vec<SocketAddr> = match public_address_r.recv().await {
+            Ok(addrs) => addrs,
             Err(RecvError::Closed) => break,
             Err(RecvError::Overflowed(_)) => {
                 debug!(
@@ -210,21 +209,22 @@ async fn dht_put(
                 continue;
             }
         };
-        debug!(log_put, "Got myown a new public address"; slog::o!("addr" => format!("{:?}", public_addr)));
+        let public_addrs_str = format!("{:?}", &public_addrs);
+        debug!(log_put, "Got myown a new public addresses"; "addrs" => &public_addrs_str);
 
         let msg = Message {
             timestamp: std::time::SystemTime::now(),
-            ip_addr_list: public_addr.map(|a| vec![a]).unwrap_or(vec![]),
+            ip_addr_list: public_addrs,
         };
 
         let value = serde_json::to_vec(&msg)?;
         let value = crypto.encrypt(&value[..])?;
 
         dht.put(&key[..], &value[..]).await?;
-        info!(log_put, "Published own public address on DHT"; slog::o!("dht_key" => general_purpose::STANDARD.encode(&key), "addr" => public_addr));
+        info!(log_put, "Published own public address on DHT"; "dht_key" => general_purpose::STANDARD.encode(&key), "addrs" => public_addrs_str);
 
         // if res.timed_out() {
-        //     debug!(log_put, "Republishing old address..."; slog::o!("addr" => public_addr));
+        //     debug!(log_put, "Republishing old address..."; "addr" => public_addr);
         // }
     }
 
@@ -259,12 +259,12 @@ async fn forward_inbound_traffic(
     local_pair: Arc<RwLocalAddr>,
 ) -> anyhow::Result<()> {
     while let Some((buf, remote_peer_addr)) = from_inet_rx.next().await {
-        debug!(log_fwd, "Received inbound packet"; slog::o!("src" => remote_peer_addr, "bytes" => buf.len()));
+        debug!(log_fwd, "Received inbound packet"; "src" => remote_peer_addr, "bytes" => buf.len());
 
         let read_set = connections.read().await;
         if !read_set.contains(&remote_peer_addr) {
             drop(read_set);
-            info!(log_fwd, "New inbound peer, adding to connections"; slog::o!("src" => remote_peer_addr));
+            info!(log_fwd, "New inbound peer, adding to connections"; "src" => remote_peer_addr);
             let mut write = connections.write().await;
             write.insert(remote_peer_addr);
         }
@@ -274,7 +274,7 @@ async fn forward_inbound_traffic(
         let lo_peer_addr = guard.1;
         if let Some(lo_peer_addr) = lo_peer_addr {
             lo_socket.send((buf.to_vec(), lo_peer_addr)).await?;
-            debug!(log_fwd, "Forwarded inbound packet"; slog::o!("remote_addr" => remote_peer_addr, "lo_addr" => lo_peer_addr));
+            debug!(log_fwd, "Forwarded inbound packet"; "remote_addr" => remote_peer_addr, "lo_addr" => lo_peer_addr);
         } else {
             debug!(
                 log_fwd,
@@ -286,33 +286,84 @@ async fn forward_inbound_traffic(
     Ok(())
 }
 
+async fn get_local_ipv6_addr() -> anyhow::Result<Option<IpAddr>> {
+    let public_socket = UdpSocket::bind("[::]:0").await?;
+    let local_addr = public_socket.local_addr()?;
+    if local_addr.is_ipv6() {
+        // Public IPv6 addr of google's 8.8.8.8 server
+        if public_socket
+            .connect("[2001:4860:4860::8888]:53")
+            .await
+            .is_ok()
+        {
+            let actual_addr = public_socket.local_addr();
+            // TODO: When address.is_global() is stable, just use that, this is missing many edge cases.
+            if let Ok(actual_addr) = actual_addr
+                && !actual_addr.ip().is_unspecified()
+                && !actual_addr.ip().is_loopback()
+            {
+                return Ok(Some(actual_addr.ip()));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 async fn lookup_public_address(
     log: slog::Logger,
-    stun_server: SocketAddr,
+    stun_server_addr: String,
     mut to_inet_tx: UdpSender,
     mut from_inet_rx: UdpReceiver,
-    public_address_s: Sender<Option<SocketAddr>>,
+    public_address_s: Sender<Vec<SocketAddr>>,
+    local_out_port: u16,
 ) -> anyhow::Result<()> {
     let stun = stun::Stun;
-    let mut old_address = None;
+    let mut old_address = vec![];
+    let mut old_server_address = None;
     loop {
+        // Resolve address here in case it changes over runtime.
+        let stun_addrs: Vec<_> = stun_server_addr.to_socket_addrs().await?.collect();
+        // Only connect to ipv4 addresses of STUN servers, as IPv6 NAT doesn't actually exist.
+        let stun_addrs_str = format!("{:?}", &stun_addrs);
+        let stun_server = stun_addrs
+            .into_iter()
+            .find(|a| a.is_ipv4())
+            .context("Failed to resolve stun server address")?;
+        if Some(stun_server) != old_server_address {
+            debug!(log, "Resolved stun server addrs"; "addrs" => stun_addrs_str, "stun_server" => stun_server);
+            old_server_address = Some(stun_server);
+        }
+
+        let mut addr_vec = vec![];
+        if let Some(addr) = get_local_ipv6_addr().await? {
+            // This hack is used so we can get the ipv6 out address, and connect to google servers in get_local_ipv6_addr, but without ruining our current socket, which cannot be unconnected easily.
+            addr_vec.push(SocketAddr::new(addr, local_out_port));
+        }
+
         match stun
             .lookup_public_address(&log, &mut to_inet_tx, &mut from_inet_rx, stun_server)
             .await
         {
             Ok(new_address) => {
                 let addr: Option<SocketAddr> = new_address.into();
-                debug!(log, "STUN succeeded"; slog::o!("addr" => addr));
-                if old_address != addr {
-                    info!(log, "STUN found new address"; slog::o!("addr" => addr));
-                    old_address = addr;
+                debug!(log, "STUN succeeded"; "addr" => addr);
+                if let Some(addr) = addr {
+                    addr_vec.push(addr);
                 }
-                public_address_s.broadcast_direct(addr).await?;
-                debug!(log, "STUN all tasks notified"; slog::o!("addr" => addr));
+                if old_address != addr_vec {
+                    let addr_vec_str = format!("{:?}", &addr_vec);
+                    info!(log, "STUN found new addresses"; "addr" => addr_vec_str);
+                    old_address = addr_vec.clone();
+                }
+                public_address_s.broadcast_direct(addr_vec).await?;
+                debug!(log, "STUN all tasks notified"; "addr" => addr);
                 async_std::task::sleep(Duration::from_secs(60)).await;
             }
             Err(err) => {
-                error!(log, "STUN failed"; slog::o!("error" => format!("{:?}", err)));
+                error!(log, "STUN failed"; "error" => format!("{:?}", err));
+                // Send an empty vector, or possibly our optional extra addr.
+                public_address_s.broadcast_direct(addr_vec).await?;
                 async_std::task::sleep(Duration::from_secs(15)).await;
             }
         }
@@ -324,22 +375,32 @@ async fn setup_stun(
     flags: &StunFlags,
     to_inet_tx: UdpSender,
     from_inet_rx: UdpReceiver,
-) -> anyhow::Result<Receiver<Option<SocketAddr>>> {
+    local_out_port: u16,
+) -> anyhow::Result<Receiver<Vec<SocketAddr>>> {
     let log_stun = log_dev.new(slog::o!("traffic" => "stun"));
-    // TODO: resolve ip later
-    let stun_server = flags.stun_addr.to_socket_addrs().await?.next().unwrap();
-    let (mut public_address_s, public_address_r) = broadcast::<Option<SocketAddr>>(1);
+    let stun_server_addr = flags.stun_addr.clone();
+    debug!(log_stun, "Stun starting resolving server"; "addr" => &stun_server_addr);
+    let (mut public_address_s, public_address_r) = broadcast::<Vec<SocketAddr>>(1);
     public_address_s.set_overflow(true);
 
     spawn(lookup_public_address(
         log_stun,
-        stun_server,
+        stun_server_addr,
         to_inet_tx,
         from_inet_rx,
         public_address_s,
+        local_out_port,
     ));
 
     Ok(public_address_r)
+}
+
+async fn get_inet_socket(log: &slog::Logger) -> anyhow::Result<(UdpSocket, u16)> {
+    let public_socket = UdpSocket::bind("[::]:0").await?;
+    let local_addr = public_socket.local_addr()?;
+    info!(log, "Creating device udp socket"; "address" => local_addr);
+
+    Ok((public_socket, local_addr.port()))
 }
 
 async fn handle_device(
@@ -356,9 +417,6 @@ async fn handle_device(
         )
     })?;
 
-    // TODO: drop last public_socket
-    //    todo!();
-
     for peer in cfg.peers.iter() {
         let remote_pkey_base64 = peer.public_key.clone();
         let remote_pkey = match PublicKey::try_from(remote_pkey_base64.as_str()) {
@@ -372,33 +430,39 @@ async fn handle_device(
             }
         };
 
-        let public_socket = UdpSocket::bind("[::]:0").await?;
-        info!(log_dev, "Creating a stun udp socket"; "address" => public_socket.local_addr()?);
+        let log_peer = if let Some(name) = &peer.name {
+            log_dev.new(slog::o!("peer" => format!("{:}", name)))
+        } else {
+            log_dev.new(slog::o!("peer" => format!("{:}", remote_pkey)))
+        };
+
+        let (public_socket, local_out_port) = get_inet_socket(&log_peer).await?;
+
         let (to_inet_tx, from_inet_rx) = split_udp_socket(public_socket);
         let (stun_rx, data_inet_rx) = split_inet_rx(from_inet_rx);
-        let public_address_r =
-            setup_stun(&log_dev, stun_flags, to_inet_tx.clone(), stun_rx).await?;
+        let public_address_r = setup_stun(
+            &log_peer,
+            stun_flags,
+            to_inet_tx.clone(),
+            stun_rx,
+            local_out_port,
+        )
+        .await?;
 
         let connections: Arc<RwAddrConnections> = Arc::new(RwLock::new(HashSet::new()));
 
         let lo_port = peer.local_port;
-        debug!(log_dev, "Connection local port is"; "port" => lo_port);
-        let log_out = log_dev.new(slog::o!("traffic" => "outbound"));
+        debug!(log_peer, "Connection local port is"; "port" => lo_port);
+        let log_out = log_peer.new(slog::o!("traffic" => "outbound"));
         let local_pair =
             new_local_socket(log_out, to_inet_tx, lo_port, connections.clone()).await?;
-        let log_fwd = log_dev.new(slog::o!("traffic" => "inbound"));
+        let log_fwd = log_peer.new(slog::o!("traffic" => "inbound"));
         spawn(forward_inbound_traffic(
             log_fwd,
             data_inet_rx,
             connections.clone(),
             local_pair,
         ));
-
-        let log_peer = if let Some(name) = &peer.name {
-            log_dev.new(slog::o!("peer" => format!("{:}", name)))
-        } else {
-            log_dev.new(slog::o!("peer" => format!("{:}", remote_pkey)))
-        };
         let log_put = log_peer.new(slog::o!("dht" => "put"));
         let log_get = log_peer.new(slog::o!("dht" => "get"));
 
@@ -423,7 +487,7 @@ async fn handle_device(
 
 async fn start_dht(log: &slog::Logger, flags: &DhtFlags) -> anyhow::Result<OpenDht> {
     let dht_log = log.new(slog::o!("task" => "dht"));
-    let dht = OpenDht::new(dht_log, flags.opendht_port, flags.bootstrap_ip.clone())
+    let dht = OpenDht::new(dht_log, flags.opendht_port, flags.bootstrap_addr.clone())
         .await
         .context("Initializing DHT failed")?;
 
@@ -436,13 +500,19 @@ async fn main() -> anyhow::Result<()> {
         bail!("Initializing sodiumoxide failed");
     }
 
+    let cfg = CliConfig::new()?;
+
     let decorator = slog_term::TermDecorator::new().build();
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
     let drain = slog_async::Async::new(drain).build().fuse();
 
-    let log = slog::Logger::root(drain, slog::o!());
-
-    let cfg = CliConfig::new(&log)?;
+    let log_level = if cfg.verbose {
+        Level::Debug
+    } else {
+        Level::Info
+    };
+    let filtered_drain = LevelFilter::new(drain, log_level).fuse();
+    let log = slog::Logger::root(filtered_drain, slog::o!());
 
     match cfg.command {
         Command::Generate => {
@@ -461,12 +531,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Stun { ref flags } => {
             let log_dev = log.new(slog::o!("dev" => "stun"));
 
-            let public_socket = UdpSocket::bind("[::]:0").await?;
-            info!(log_dev, "Creating a stun udp socket"; "address" => public_socket.local_addr()?);
+            let (public_socket, local_out_port) = get_inet_socket(&log_dev).await?;
             let (to_inet_tx, from_inet_rx) = split_udp_socket(public_socket);
 
             let mut public_address_r =
-                setup_stun(&log_dev, flags, to_inet_tx, from_inet_rx).await?;
+                setup_stun(&log_dev, flags, to_inet_tx, from_inet_rx, local_out_port).await?;
 
             let public_address = public_address_r.recv_direct().await?;
             info!(log, "Got public address {:?}", public_address);

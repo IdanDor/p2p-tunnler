@@ -1,7 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use config::Config;
 use serde::Deserialize;
-use slog::debug;
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
@@ -9,12 +8,12 @@ use std::path::PathBuf;
 #[command(version, about, long_about=None)]
 pub struct CliConfig {
     #[arg(
-        short = 'f',
-        long = "ifnames",
-        value_delimiter = ',',
-        help = "Restrict to thses devices [default: all]"
+        short,
+        long,
+        help = "Set verbosity to debug instead of info",
+        global = true
     )]
-    pub interfaces: Vec<String>,
+    pub verbose: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -43,7 +42,7 @@ pub enum Command {
 #[derive(Args, Debug)]
 pub struct StunFlags {
     #[arg(
-        long = "stun_addr",
+        long,
         default_value = "stun.wtfismyip.com:3478",
         help = "Stun server:ip to work with"
     )]
@@ -53,11 +52,11 @@ pub struct StunFlags {
 #[derive(Args, Debug)]
 pub struct DhtFlags {
     #[arg(
-        long = "bootstrap_ip",
+        long,
         default_value = "bootstrap.jami.net:4222",
         help = "OpenDHT server:ip to bootstrap with"
     )]
-    pub bootstrap_ip: String,
+    pub bootstrap_addr: String,
     #[arg(
         short = 'P',
         long = "port",
@@ -99,7 +98,7 @@ pub struct Peer {
 }
 
 impl CliConfig {
-    pub fn new(log: &slog::Logger) -> anyhow::Result<CliConfig> {
+    pub fn new() -> anyhow::Result<CliConfig> {
         let mut cli = CliConfig::parse();
 
         if let Command::Run(ref mut command) = cli.command {
@@ -114,7 +113,6 @@ impl CliConfig {
                     .build()?
                     .try_deserialize()?;
 
-                debug!(log, "Tunnels configuration {:?}", connection);
                 command.connections.push(connection);
             }
         }
