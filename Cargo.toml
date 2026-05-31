@@ -30,6 +30,7 @@ async-std = { version = "1.13", features = ["attributes"] }
 async-broadcast = "0.7"
 
 
-opendht = { path = "../opendht-rs" }
+# opendht = { path = "../opendht-rs" }
+opendht = { git = "https://github.com/IdanDor/opendht.git" }
 clap = { version = "4.6", features = ["derive"] }
 config = "0.15"
