@@ -1,9 +1,9 @@
 [package]
-name = "wireguard-p2p"
-version = "0.3.0"
-description = "A WireGuard peer-to-peer client"
+name = "p2p-tunnler"
+version = "0.1.0"
+description = "A peer-to-peer tunnler using OpenDHT for ip exchange, for example for wireguard connections"
 license = "LGPL-2.1+"
-authors = ["Manuel Schölling <manuel.schoelling@posteo.de>"]
+authors = ["Idan Dor <>"]
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -28,7 +28,6 @@ lazy_static = "1.4.0"
 
 async-std = { version = "1.13", features = ["attributes"] }
 async-broadcast = "0.7"
-
 
 # opendht = { path = "../opendht-rs" }
 opendht = { git = "https://github.com/IdanDor/opendht.git" }

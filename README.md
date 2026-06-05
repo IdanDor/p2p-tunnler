@@ -1,22 +1,13 @@
-Exchanges your IP via a OpenDHT.
+Tunnels packets p2p from two instances of this, using OpenDHT for ip exchange.
+Each instance of this program can create multiple tunnels (different src ports, and different peer public keys) per single private key, of which their can be multiple, which is a bit over-engineered.
+NOTE: only the ip exchange is encrypted and verified, the traffic is NOT verfied or encrypted at all.
+NOTE: libsodium curve25519 is used for the crypto.
 
-Just run `wg-quick up wg0` and then `sudo wireguard-p2p` on both peers.
-wireguard-p2p will determine your current public IP, exchange it via OpenDHT, set the endpoint to a localhost port and proxy packages between both peers.
+I made this to be able to freely run wireguard p2p behind NATs.
+Specifically, I inted to run this service in a sandboxed systemd service to connect from my laptop to PC.
 
+Use on your own risk.
 
-## Install
-```bash
-cargo install wireguard-p2p
-```
+Based on the inactive project of [wireguard-p2p](https://github.com/manuels/wireguard-p2p) by manuels.
 
-## Dependencies
-
-### OpenDHT
-OpenDHT will have to be discoverable by pkgconfig
-
-Follow the build/install instructions [here](https://github.com/savoirfairelinux/opendht/wiki/Build-the-library#using-cmake)
-
-### Fedora
-```bash
-sudo dnf install -y jsoncpp-devel http-parser-devel
-```
+To compile, I recommend the devshell and nix builders on my other [repository](https://github.com/IdanDor/p2p-tunnler-nix).

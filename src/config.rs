@@ -46,7 +46,7 @@ pub enum Command {
 
 #[derive(Args, Debug)]
 pub struct GenFlags {
-    #[arg(help = "Output path for private key, if not given, will be printed to stdou")]
+    #[arg(help = "Output path for private key, if not given, will be printed to stdout")]
     pub path: Option<String>,
 
     #[arg(

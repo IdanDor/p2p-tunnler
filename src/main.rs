@@ -322,6 +322,7 @@ async fn lookup_public_address(
     mut from_inet_rx: UdpReceiver,
     public_address_s: Sender<Vec<SocketAddr>>,
     local_out_port: u16,
+    run_once: bool,
 ) -> anyhow::Result<()> {
     let stun = stun::Stun;
     let mut old_address = vec![];
@@ -372,6 +373,10 @@ async fn lookup_public_address(
                 async_std::task::sleep(Duration::from_secs(15)).await;
             }
         }
+
+        if run_once {
+            break Ok(());
+        }
     }
 }
 
@@ -381,6 +386,7 @@ async fn setup_stun(
     to_inet_tx: UdpSender,
     from_inet_rx: UdpReceiver,
     local_out_port: u16,
+    run_once: bool,
 ) -> anyhow::Result<Receiver<Vec<SocketAddr>>> {
     let log_stun = log_dev.new(slog::o!("traffic" => "stun"));
     let stun_server_addr = flags.stun_addr.clone();
@@ -395,6 +401,7 @@ async fn setup_stun(
         from_inet_rx,
         public_address_s,
         local_out_port,
+        run_once,
     ));
 
     Ok(public_address_r)
@@ -451,6 +458,7 @@ async fn handle_device(
             to_inet_tx.clone(),
             stun_rx,
             local_out_port,
+            false,
         )
         .await?;
 
@@ -605,11 +613,21 @@ async fn main() -> anyhow::Result<()> {
             let (public_socket, local_out_port) = get_inet_socket(&log_dev).await?;
             let (to_inet_tx, from_inet_rx) = split_udp_socket(public_socket);
 
-            let mut public_address_r =
-                setup_stun(&log_dev, flags, to_inet_tx, from_inet_rx, local_out_port).await?;
+            let mut public_address_r = setup_stun(
+                &log_dev,
+                flags,
+                to_inet_tx,
+                from_inet_rx,
+                local_out_port,
+                true,
+            )
+            .await?;
 
-            let public_address = public_address_r.recv_direct().await?;
-            info!(log, "Got public address {:?}", public_address);
+            let public_address = public_address_r.recv().await;
+            info!(log, "Got public address result {:?}", public_address);
+            // To get the final log print.
+            drop(log);
+            std::thread::sleep(std::time::Duration::from_secs(2));
         }
         Command::Dht { ref flags } => {
             let dht = start_dht(&log, flags).await?;
