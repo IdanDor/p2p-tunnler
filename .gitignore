@@ -1,5 +1,5 @@
 /target
 .idea
-Cargo.lock
-Cargo.nix
-crate-hashes.json
+# Cargo.lock
+# Cargo.nix
+# crate-hashes.json
