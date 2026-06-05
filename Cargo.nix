@@ -3044,6 +3044,7 @@ rec {
           {
             name = "slog";
             packageId = "slog";
+            features = [ "max_level_debug" ];
           }
           {
             name = "slog-async";
@@ -4122,7 +4123,7 @@ rec {
           "parking_lot_0_12" = [ "dep:parking_lot_0_12" ];
           "std" = [ "serde_core?/std" "anyhow?/std" ];
         };
-        resolvedDefaultFeatures = [ "default" "nested-values" "std" ];
+        resolvedDefaultFeatures = [ "default" "max_level_debug" "nested-values" "std" ];
       };
       "slog-async" = rec {
         crateName = "slog-async";
