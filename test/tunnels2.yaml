@@ -1,6 +1,12 @@
+# Type1:
 # public_key: "Qlfsb08uHmhqLgPUKnn4OooxCqIm+DnAsqA116nlCxM="
-secret_key: "8RgMh7rfXg6ptGnWiDuiRrP55Aom0bmOzaaWkXb6Yws="
+# secret_key: "8RgMh7rfXg6ptGnWiDuiRrP55Aom0bmOzaaWkXb6Yws="
+# Type2:
+secret_key: "file:test/id_10002"
 peers:
-  - name: "tunnels1_peer"
+  - name: "tunnel_to_1"
     local_port: 10002
-    public_key: "81jls/NwG8yuvV0AFQOHGtj3/olvwSUaoQ3He3bnuzU="
+    # Type1:
+    # public_key: "81jls/NwG8yuvV0AFQOHGtj3/olvwSUaoQ3He3bnuzU="
+    # Type2:
+    public_key: "file:test/id_10001.pub"

@@ -22,7 +22,7 @@ use slog::{Drain, Level, LevelFilter};
 use slog::{crit, debug, error, info};
 
 use base64::{Engine, engine::general_purpose};
-use config::{CliConfig, Command, DhtFlags, P2PConnection, StunFlags};
+use config::{CliConfig, Command, DhtFlags, GenFlags, P2PConnection, StunFlags};
 use crypto::*;
 use dht::OpenDht;
 use futures::stream::StreamExt;
@@ -30,6 +30,11 @@ use message::Message;
 use stun::codec::MAGIC_COOKIE;
 use utils::*;
 use utils::{UdpReceiver, UdpSender};
+
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 type RwAddrConnections = RwLock<HashSet<SocketAddr>>;
 type RwLocalAddr = RwLock<(UdpSender, Option<SocketAddr>)>;
@@ -494,6 +499,59 @@ async fn start_dht(log: &slog::Logger, flags: &DhtFlags) -> anyhow::Result<OpenD
     Ok(dht)
 }
 
+fn get_generate_file(flags: &GenFlags) -> anyhow::Result<(Option<File>, Option<File>)> {
+    let file = match &flags.path {
+        Some(path) => {
+            let mut opts = OpenOptions::new();
+            if flags.override_files {
+                opts.create(true);
+            } else {
+                opts.create_new(true);
+            }
+
+            Some(opts
+                .write(true)
+                .open(path)
+                .context("Failed to open private key file for writing (and create new if not --override-files)")?)
+        }
+        None => None,
+    };
+
+    #[cfg(unix)]
+    if !flags.insecure_priv
+        && let Some(ref f) = file
+    {
+        let metadata = f.metadata()?;
+        let mut permissions = metadata.permissions();
+
+        permissions.set_mode(0o600);
+        f.set_permissions(permissions)
+            .context("Failed to set security permissions for private key file")?;
+    }
+
+    let pub_path = flags
+        .pub_path
+        .clone()
+        .or_else(|| flags.path.clone().map(|path| path + ".pub"));
+    let pub_file = match pub_path {
+        Some(path) => {
+            let mut opts = OpenOptions::new();
+            if flags.override_files {
+                opts.create(true);
+            } else {
+                opts.create_new(true);
+            }
+
+            Some(opts
+                .write(true)
+                .open(path)
+                .context("Failed to open public key file for writing (and create new if not --override-files)")?)
+        }
+        None => None,
+    };
+    Ok((file, pub_file))
+}
+
 #[async_std::main]
 async fn main() -> anyhow::Result<()> {
     if let Err(()) = sodiumoxide::init() {
@@ -515,12 +573,25 @@ async fn main() -> anyhow::Result<()> {
     let log = slog::Logger::root(filtered_drain, slog::o!());
 
     match cfg.command {
-        Command::Generate => {
-            let (sk, display, pk) = generate_secret_key_base64();
-            info!(log, "SecretKey is {:}", display);
+        Command::Generate { ref flags } => {
+            let (sk, sk_base64, pk) = generate_secret_key_base64();
+            let (priv_file, pub_file) = get_generate_file(&flags)?;
+
+            if let Some(mut file) = priv_file {
+                file.write_all(sk_base64.as_bytes())
+                    .context("Failed to write base64 to secret key file")?;
+            } else {
+                info!(log, "SecretKey is {:}", sk_base64);
+            }
+
             info!(log, "PublicKey is {:}", sk.public_key());
+            if let Some(mut file) = pub_file {
+                file.write_all(pk.to_string().as_bytes())
+                    .context("Failed to write base64 to secret key file")?;
+            }
+
             debug!(log, "PublicKey from library is {:}", pk);
-            let new_sk = SecretKey::try_from(display.as_str())
+            let new_sk = SecretKey::try_from(sk_base64.as_str())
                 .expect("Failed at reloading a key just generated");
             debug!(
                 log,

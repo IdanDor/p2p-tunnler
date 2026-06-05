@@ -1,7 +1,9 @@
+use anyhow::{Context, anyhow};
 use clap::{Args, Parser, Subcommand};
 use config::Config;
 use serde::Deserialize;
 use std::ffi::OsStr;
+use std::fs;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -21,7 +23,10 @@ pub struct CliConfig {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     #[command(alias="gen", about="Generate and print a new secret and public key", long_about=None)]
-    Generate,
+    Generate {
+        #[command(flatten)]
+        flags: GenFlags,
+    },
 
     #[command(about="Run a stun IP test to get current IP", long_about=None)]
     Stun {
@@ -37,6 +42,25 @@ pub enum Command {
 
     #[command(about="Run service", long_about=None)]
     Run(RunCommand),
+}
+
+#[derive(Args, Debug)]
+pub struct GenFlags {
+    #[arg(help = "Output path for private key, if not given, will be printed to stdou")]
+    pub path: Option<String>,
+
+    #[arg(
+        short,
+        long,
+        help = "Output path for public key, default is <path>+.pub, if given"
+    )]
+    pub pub_path: Option<String>,
+
+    #[arg(short, long, help = "Do not limit private key permissions to 0600")]
+    pub insecure_priv: bool,
+
+    #[arg(short, long, help = "Override existing files if given")]
+    pub override_files: bool,
 }
 
 #[derive(Args, Debug)]
@@ -97,6 +121,17 @@ pub struct Peer {
     pub name: Option<String>,
 }
 
+fn transform_file_to_string(data: String) -> anyhow::Result<String> {
+    Ok(if let Some(path) = data.strip_prefix("file:") {
+        fs::read_to_string(path).context(anyhow!(
+            "Failed to open and read key file, at path {}",
+            path
+        ))?
+    } else {
+        data
+    })
+}
+
 impl CliConfig {
     pub fn new() -> anyhow::Result<CliConfig> {
         let mut cli = CliConfig::parse();
@@ -108,10 +143,15 @@ impl CliConfig {
                     tun.add_extension("yaml");
                 }
 
-                let connection: P2PConnection = Config::builder()
+                let mut connection: P2PConnection = Config::builder()
                     .add_source(config::File::from(tun))
                     .build()?
                     .try_deserialize()?;
+
+                connection.secret_key = transform_file_to_string(connection.secret_key)?;
+                for peer in connection.peers.iter_mut() {
+                    peer.public_key = transform_file_to_string(peer.public_key.clone())?;
+                }
 
                 command.connections.push(connection);
             }
