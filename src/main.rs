@@ -22,7 +22,7 @@ use slog::{Drain, Level, LevelFilter};
 use slog::{crit, debug, error, info};
 
 use base64::{Engine, engine::general_purpose};
-use config::{CliConfig, Command, DhtFlags, GenFlags, P2PConnection, StunFlags};
+use config::{CliConfig, Command, ConnectionFlags, DhtFlags, GenFlags, P2PConnection, StunFlags};
 use crypto::*;
 use dht::OpenDht;
 use futures::stream::StreamExt;
@@ -95,6 +95,7 @@ async fn dht_get(
     private_key: SecretKey,
     remote_pkey: PublicKey,
     connections: Arc<RwAddrConnections>,
+    connection_flags: ConnectionFlags,
 ) -> anyhow::Result<()> {
     let secret_key = private_key;
     let local_pkey = secret_key.public_key();
@@ -156,9 +157,16 @@ async fn dht_get(
             continue;
         }
         last_timestamp = msg.as_ref().map(|m| m.timestamp);
-        let ip_addr_list = msg.map(|m| m.ip_addr_list).unwrap_or(vec![]);
+        let mut ip_addr_list = msg.map(|m| m.ip_addr_list).unwrap_or(vec![]);
 
-        let new_set: HashSet<_> = ip_addr_list.into_iter().filter(
+        if connection_flags.filter_ipv6 {
+            ip_addr_list = ip_addr_list
+                .into_iter()
+                .filter(|addr| addr.ip().is_ipv4())
+                .collect();
+        }
+
+        let mut new_set: HashSet<_> = ip_addr_list.into_iter().filter(
             // TODO: When address.is_global() is stable, just use that, this is missing many edge cases.
             |addr| !addr.ip().is_loopback() && !addr.ip().is_unspecified() && !addr.ip().is_multicast()
                 // Make sure the port seems reasonable
@@ -167,6 +175,9 @@ async fn dht_get(
         let mut need_write = false;
 
         let known_connections = connections.read().await;
+        if connection_flags.no_clear {
+            new_set.extend(&*known_connections);
+        }
         for remote_peer_addr in known_connections.difference(&new_set) {
             need_write = true;
             info!(log_get, "Known peer address will no longer be used, not found in DHT"; "addr" => remote_peer_addr);
@@ -420,6 +431,7 @@ async fn handle_device(
     dht: OpenDht,
     stun_flags: &StunFlags,
     cfg: &P2PConnection,
+    connection_flags: ConnectionFlags,
 ) -> anyhow::Result<()> {
     let secret_key = SecretKey::try_from(cfg.secret_key.as_str()).map_err(|e| {
         anyhow!(
@@ -492,6 +504,7 @@ async fn handle_device(
             secret_key.clone(),
             remote_pkey,
             connections,
+            connection_flags.clone(),
         ));
     }
 
@@ -653,6 +666,7 @@ async fn main() -> anyhow::Result<()> {
                     dht.clone(),
                     &cmd.stun_flags,
                     connection,
+                    cmd.connection_flags.clone(),
                 ));
             }
 

@@ -90,6 +90,23 @@ pub struct DhtFlags {
     pub opendht_port: u16,
 }
 
+#[derive(Args, Debug, Clone)]
+pub struct ConnectionFlags {
+    #[arg(
+        short,
+        long,
+        help = "Set filter ipv6, so we would only connect to ipv4"
+    )]
+    pub filter_ipv6: bool,
+
+    #[arg(
+        short,
+        long,
+        help = "Dont clear old ips after new dht_get result, only append"
+    )]
+    pub no_clear: bool,
+}
+
 #[derive(Args, Debug)]
 pub struct RunCommand {
     #[command(flatten)]
@@ -97,6 +114,9 @@ pub struct RunCommand {
 
     #[command(flatten)]
     pub dht_flags: DhtFlags,
+
+    #[command(flatten)]
+    pub connection_flags: ConnectionFlags,
 
     #[arg(
         default_value = "./tunnels.yaml",
