@@ -105,6 +105,14 @@ pub struct ConnectionFlags {
         help = "Dont clear old ips after new dht_get result, only append"
     )]
     pub no_clear: bool,
+
+    #[arg(
+        short,
+        long,
+        help = "The local out going port, default is 0 which means a random port is set",
+        default_value_t = 0
+    )]
+    pub out_port: u16,
 }
 
 #[derive(Args, Debug)]

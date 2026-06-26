@@ -418,8 +418,8 @@ async fn setup_stun(
     Ok(public_address_r)
 }
 
-async fn get_inet_socket(log: &slog::Logger) -> anyhow::Result<(UdpSocket, u16)> {
-    let public_socket = UdpSocket::bind("[::]:0").await?;
+async fn get_inet_socket(log: &slog::Logger, out_port: u16) -> anyhow::Result<(UdpSocket, u16)> {
+    let public_socket = UdpSocket::bind(("::", out_port)).await?;
     let local_addr = public_socket.local_addr()?;
     info!(log, "Creating device udp socket"; "address" => local_addr);
 
@@ -460,7 +460,8 @@ async fn handle_device(
             log_dev.new(slog::o!("peer" => format!("{:}", remote_pkey)))
         };
 
-        let (public_socket, local_out_port) = get_inet_socket(&log_peer).await?;
+        let (public_socket, local_out_port) =
+            get_inet_socket(&log_peer, connection_flags.out_port).await?;
 
         let (to_inet_tx, from_inet_rx) = split_udp_socket(public_socket);
         let (stun_rx, data_inet_rx) = split_inet_rx(from_inet_rx);
@@ -623,7 +624,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Stun { ref flags } => {
             let log_dev = log.new(slog::o!("dev" => "stun"));
 
-            let (public_socket, local_out_port) = get_inet_socket(&log_dev).await?;
+            let (public_socket, local_out_port) = get_inet_socket(&log_dev, 0).await?;
             let (to_inet_tx, from_inet_rx) = split_udp_socket(public_socket);
 
             let mut public_address_r = setup_stun(
