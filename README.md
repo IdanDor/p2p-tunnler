@@ -1,4 +1,8 @@
 Tunnels packets p2p from two instances of this, using OpenDHT for ip exchange.
+
+Version 0.1.0 was the last version written fully by humans. Starting with
+version 0.2.0, AI has been used to write and modify this code.
+
 Each instance of this program can create multiple tunnels (different src ports, and different peer public keys) per single private key, of which their can be multiple, which is a bit over-engineered.
 NOTE: only the ip exchange is encrypted and verified, the traffic is NOT verfied or encrypted at all.
 NOTE: libsodium curve25519 is used for the crypto.

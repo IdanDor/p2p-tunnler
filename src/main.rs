@@ -2,6 +2,7 @@ mod config;
 mod crypto;
 mod dht;
 mod message;
+mod nat;
 mod stun;
 mod utils;
 
@@ -38,6 +39,15 @@ use std::os::unix::fs::PermissionsExt;
 
 type RwAddrConnections = RwLock<HashSet<SocketAddr>>;
 type RwLocalAddr = RwLock<(UdpSender, Option<SocketAddr>)>;
+
+fn is_usable_peer_addr(addr: &SocketAddr) -> bool {
+    // TODO: When address.is_global() is stable, just use that; this is missing many edge cases.
+    !addr.ip().is_loopback()
+        && !addr.ip().is_unspecified()
+        && !addr.ip().is_multicast()
+        // Avoid well-known/privileged ports, while allowing the full ephemeral-port range.
+        && addr.port() > 1024
+}
 
 async fn create_local_receiever(lo_port: u16) -> anyhow::Result<UdpSocket> {
     Ok(UdpSocket::bind(("127.0.0.1", lo_port)).await?)
@@ -166,12 +176,10 @@ async fn dht_get(
                 .collect();
         }
 
-        let mut new_set: HashSet<_> = ip_addr_list.into_iter().filter(
-            // TODO: When address.is_global() is stable, just use that, this is missing many edge cases.
-            |addr| !addr.ip().is_loopback() && !addr.ip().is_unspecified() && !addr.ip().is_multicast()
-                // Make sure the port seems reasonable
-                && !addr.port() > 1024
-        ).collect();
+        let mut new_set: HashSet<_> = ip_addr_list
+            .into_iter()
+            .filter(is_usable_peer_addr)
+            .collect();
         let mut need_write = false;
 
         let known_connections = connections.read().await;
@@ -195,6 +203,21 @@ async fn dht_get(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_usable_peer_addr;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn accepts_the_full_unprivileged_port_range() {
+        let ip = [192, 0, 2, 1];
+
+        assert!(!is_usable_peer_addr(&SocketAddr::from((ip, 1024))));
+        assert!(is_usable_peer_addr(&SocketAddr::from((ip, 1025))));
+        assert!(is_usable_peer_addr(&SocketAddr::from((ip, u16::MAX))));
+    }
 }
 
 async fn dht_put(
@@ -333,6 +356,7 @@ async fn lookup_public_address(
     mut from_inet_rx: UdpReceiver,
     public_address_s: Sender<Vec<SocketAddr>>,
     local_out_port: u16,
+    nat_mapping: Option<nat::Mapping>,
     run_once: bool,
 ) -> anyhow::Result<()> {
     let stun = stun::Stun;
@@ -366,6 +390,19 @@ async fn lookup_public_address(
                 let addr: Option<SocketAddr> = new_address.into();
                 debug!(log, "STUN succeeded"; "addr" => addr);
                 if let Some(addr) = addr {
+                    if let Some(mapping) = nat_mapping
+                        && mapping.external_addr.ip() == addr.ip()
+                    {
+                        addr_vec.push(mapping.external_addr);
+                    } else if let Some(mapping) = nat_mapping {
+                        info!(
+                            log,
+                            "Ignoring router mapping with a different public IP than STUN";
+                            "mapping" => mapping.external_addr,
+                            "method" => mapping.method.to_string(),
+                            "stun" => addr
+                        );
+                    }
                     addr_vec.push(addr);
                 }
                 if old_address != addr_vec {
@@ -397,6 +434,7 @@ async fn setup_stun(
     to_inet_tx: UdpSender,
     from_inet_rx: UdpReceiver,
     local_out_port: u16,
+    nat_mapping: Option<nat::Mapping>,
     run_once: bool,
 ) -> anyhow::Result<Receiver<Vec<SocketAddr>>> {
     let log_stun = log_dev.new(slog::o!("traffic" => "stun"));
@@ -412,6 +450,7 @@ async fn setup_stun(
         from_inet_rx,
         public_address_s,
         local_out_port,
+        nat_mapping,
         run_once,
     ));
 
@@ -465,12 +504,37 @@ async fn handle_device(
 
         let (to_inet_tx, from_inet_rx) = split_udp_socket(public_socket);
         let (stun_rx, data_inet_rx) = split_inet_rx(from_inet_rx);
+        let nat_mapping = if connection_flags.nat_map {
+            info!(log_peer, "Requesting local-router UDP mapping"; "local_port" => local_out_port);
+            match nat::map_udp_port(log_peer.clone(), local_out_port).await {
+                Ok(mapping) => {
+                    info!(
+                        log_peer,
+                        "Local-router UDP mapping created";
+                        "external_addr" => mapping.external_addr,
+                        "method" => mapping.method.to_string()
+                    );
+                    Some(mapping)
+                }
+                Err(error) => {
+                    error!(
+                        log_peer,
+                        "Local-router UDP mapping unavailable; continuing with STUN";
+                        "error" => format!("{error:#}")
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let public_address_r = setup_stun(
             &log_peer,
             stun_flags,
             to_inet_tx.clone(),
             stun_rx,
             local_out_port,
+            nat_mapping,
             false,
         )
         .await?;
@@ -633,6 +697,7 @@ async fn main() -> anyhow::Result<()> {
                 to_inet_tx,
                 from_inet_rx,
                 local_out_port,
+                None,
                 true,
             )
             .await?;

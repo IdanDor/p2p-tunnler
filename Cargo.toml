@@ -1,6 +1,6 @@
 [package]
 name = "p2p-tunnler"
-version = "0.1.0"
+version = "0.2.0"
 description = "A peer-to-peer tunnler using OpenDHT for ip exchange, for example for wireguard connections"
 license = "LGPL-2.1+"
 authors = ["Idan Dor <>"]
@@ -28,6 +28,9 @@ lazy_static = "1.4.0"
 
 async-std = { version = "1.13", features = ["attributes"] }
 async-broadcast = "0.7"
+crab_nat = "0.8.1"
+igd-next = "0.17.1"
+tokio = { version = "1.52", features = ["rt", "net", "time"] }
 
 # opendht = { path = "../opendht-rs" }
 opendht = { git = "https://github.com/IdanDor/opendht.git" }

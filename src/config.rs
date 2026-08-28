@@ -113,6 +113,12 @@ pub struct ConnectionFlags {
         default_value_t = 0
     )]
     pub out_port: u16,
+
+    #[arg(
+        long,
+        help = "Request a direct inbound UDP mapping from the local router using PCP, NAT-PMP, or UPnP IGD"
+    )]
+    pub nat_map: bool,
 }
 
 #[derive(Args, Debug)]
