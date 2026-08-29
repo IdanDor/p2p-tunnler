@@ -6,6 +6,12 @@
   that must remain compatible with an unmodified 0.1.0 peer.
 - [Direct-only NAT traversal](direct-only-nat-traversal.md): design and
   constraints for direct connectivity without a traffic relay.
+- [Architecture](architecture.md): data/control-plane boundaries and runtime
+  responsibilities.
+- [Operations guide](operations.md): configuration, flags, and connectivity
+  diagnosis.
+- [Development and AI-assisted work](development.md): validation, dependency,
+  and review requirements.
 
 Keep long-lived design decisions, compatibility constraints, and operational
 guidance here. Do not place keys, production endpoints, or packet captures

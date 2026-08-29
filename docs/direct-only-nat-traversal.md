@@ -13,18 +13,20 @@ a privileged port.
 ## Constraint
 
 An IPv4-only peer must not send to, or select, an IPv6 address. The current
-`--filter-ipv6` switch is a workaround for this requirement, but filtering an
-address after it has been exchanged is not the right long-term model.
+`--filter-ipv6` switch (also available as `--ipv4-only`) suppresses local IPv6
+candidate publication and rejects IPv6 remote candidates, including candidates
+otherwise retained by `--no-clear`. This preserves compatibility with an
+unmodified IPv4-only 0.1.0 peer.
 
 Instead, treat IPv4 and IPv6 as separate candidate families. An IPv4-only peer
 creates only IPv4 candidate pairs; an IPv6 candidate is never probed unless
 both peers have a usable IPv6 candidate. This avoids the observed failed IPv6
 send/crash path without disabling IPv6 for peers that can use it.
 
-Use distinct IPv4 and IPv6 UDP sockets rather than one dual-stack wildcard
-socket. A socket is associated with candidates of its own address family, so
-the forwarding path cannot accidentally send IPv4 WireGuard traffic to an IPv6
-candidate or vice versa.
+The longer-term candidate-pair design should use distinct IPv4 and IPv6 UDP
+sockets rather than one dual-stack wildcard socket. A socket is then associated
+with candidates of its own address family, so the forwarding path cannot
+accidentally send IPv4 WireGuard traffic to an IPv6 candidate or vice versa.
 
 ## Direct-only candidate strategy
 
@@ -48,8 +50,9 @@ PCP is preferred because its MAP operation requests an explicit inbound
 mapping, including when the ordinary NAT behavior is endpoint-dependent.
 NAT-PMP and UPnP IGD are fallbacks for common consumer routers. All three are
 ordinary user-space requests to the local gateway; they need no Linux
-capabilities. Mapping creation is opt-in (`--nat-map`), renewed before its
-lease expires, and should be removed on clean shutdown.
+capabilities. Mapping creation is opt-in (`--nat-map`) and renewed before its
+lease expires. The current implementation relies on router lease expiry when
+the process exits rather than guaranteeing explicit removal on shutdown.
 
 Useful Rust implementation options are
 [`crab_nat`](https://docs.rs/crab_nat/latest/crab_nat/) for PCP/NAT-PMP and
@@ -57,8 +60,8 @@ Useful Rust implementation options are
 
 ## Connection establishment
 
-Replace the current single-address, immediate-forwarding behavior with a
-small, direct-only ICE-style state machine:
+A fuller future improvement would replace the current immediate-forwarding
+behavior with a small, direct-only ICE-style state machine:
 
 1. Exchange candidate lists, candidate type, expiry, generation, and an
    ephemeral probe token through the encrypted DHT value.
