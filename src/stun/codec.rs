@@ -3,10 +3,7 @@
 use std::io::Cursor;
 use std::io::Error;
 use std::io::ErrorKind;
-use std::io::Read;
 use std::io::Result;
-use std::io::Seek;
-use std::io::SeekFrom;
 use std::io::Write;
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -109,12 +106,18 @@ impl StunCodec {
 
         let (typ, m) = match req {
             Request::Bind(bind) => (BINDING_REQUEST, bind.encode()?),
-            _ => unimplemented!(),
+            Request::SharedSecret => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "shared-secret STUN requests are not supported",
+                ));
+            }
         };
+        let message_length = u16::try_from(m.len())
+            .map_err(|_| Error::new(ErrorKind::InvalidInput, "STUN request is too large"))?;
 
         buf.put_u16(typ);
-        // buf.write_u16::<NetworkEndian>(m.len() as u16 + 24).unwrap();
-        buf.put_u16(m.len() as u16);
+        buf.put_u16(message_length);
         // Send magic cookie, still use transaction ids which are only 8 bytes.
         buf.put_u64((MAGIC_COOKIE as u64) << 32);
         buf.put_u64(trans_id);
@@ -138,17 +141,16 @@ impl StunCodec {
         */
     }
 
-    fn read_binding_response(c: &mut Cursor<Vec<u8>>) -> Result<BindResponse> {
+    fn read_binding_response(c: &mut Cursor<&[u8]>, xor_key: &[u8; 16]) -> Result<BindResponse> {
         let mut mapped_address = None;
         let mut source_address = None;
         let mut changed_address = None;
-        let mut message_integrity = None;
         let mut reflected_from = None;
 
         let error = |reason| Error::new(ErrorKind::InvalidData, reason);
 
-        loop {
-            let attr = Attribute::read(c);
+        while (c.position() as usize) < c.get_ref().len() {
+            let attr = Attribute::read(c, xor_key);
             match attr {
                 Ok(Attribute::MappedAddress(s)) => {
                     mapped_address.get_or_insert(s);
@@ -162,24 +164,11 @@ impl StunCodec {
                 Ok(Attribute::ReflectedFrom(s)) => {
                     reflected_from.get_or_insert(s);
                 }
-                Ok(Attribute::MessageIntegrity(s)) => {
-                    message_integrity.get_or_insert(s);
-                }
+                Ok(Attribute::MessageIntegrity(_)) => continue,
                 Ok(Attribute::UnknownOptional) => continue,
-                Err(ref e) if e.kind() == ErrorKind::UnexpectedEof => break,
                 _ => return Err(error("Unknown mandatory attribute!")),
             };
         }
-
-        /*
-        if let Some(expected) = message_integrity {
-            let actual = digest::digest(&digest::SHA1, &msg[..msg.len() - 24]);
-
-            if verify_slices_are_equal(actual.as_ref(), &expected).is_err() {
-                return Err(error("Message integrity violated!"));
-            }
-        }
-        */
 
         Ok(BindResponse {
             mapped_address: mapped_address.ok_or_else(|| error("MappedAddress missing!"))?,
@@ -200,12 +189,12 @@ impl StunCodec {
     }
 
     pub fn decode_const(expected_id: u64, msg: Vec<u8>) -> Result<Option<Response>> {
-        let mut c = Cursor::new(msg);
+        let mut header = Cursor::new(msg.as_slice());
 
-        let msg_type = c.read_u16::<NetworkEndian>()?;
-        let _msg_len = c.read_u16::<NetworkEndian>()?;
-        let trans_id1 = c.read_u64::<NetworkEndian>()?;
-        let trans_id2 = c.read_u64::<NetworkEndian>()?;
+        let msg_type = header.read_u16::<NetworkEndian>()?;
+        let message_length = usize::from(header.read_u16::<NetworkEndian>()?);
+        let trans_id1 = header.read_u64::<NetworkEndian>()?;
+        let trans_id2 = header.read_u64::<NetworkEndian>()?;
 
         // The socket also receives data packets, if we do not verify this, we have no way of knowing it isn't a stun response.
         // We try to parse all packets, and only some will pass this filter and the next one.
@@ -220,8 +209,24 @@ impl StunCodec {
             ));
         }
 
+        let message_end = 20usize
+            .checked_add(message_length)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid STUN message length"))?;
+        if msg.len() != message_end {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "STUN message length does not match the datagram",
+            ));
+        }
+        let mut xor_key = [0; 16];
+        xor_key[..8].copy_from_slice(&trans_id1.to_be_bytes());
+        xor_key[8..].copy_from_slice(&trans_id2.to_be_bytes());
+        let mut body = Cursor::new(&msg[20..]);
+
         let res = match msg_type {
-            BINDING_RESPONSE => StunCodec::read_binding_response(&mut c).map(Response::Bind),
+            BINDING_RESPONSE => {
+                StunCodec::read_binding_response(&mut body, &xor_key).map(Response::Bind)
+            }
             BINDING_ERROR => Err(Error::new(
                 ErrorKind::InvalidData,
                 "BINDING_ERROR unimplemented",
@@ -242,79 +247,136 @@ impl StunCodec {
 }
 
 impl Attribute {
-    fn read(c: &mut Cursor<Vec<u8>>) -> Result<Attribute> {
+    fn read(c: &mut Cursor<&[u8]>, xor_key: &[u8; 16]) -> Result<Attribute> {
         let typ = c.read_u16::<NetworkEndian>()?;
-        let len = c.read_u16::<NetworkEndian>()?;
+        let length = usize::from(c.read_u16::<NetworkEndian>()?);
+        let padded_length = length
+            .checked_add(3)
+            .map(|length| length & !3)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid STUN attribute length"))?;
+        let start = c.position() as usize;
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid STUN attribute length"))?;
+        let padded_end = start
+            .checked_add(padded_length)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid STUN attribute length"))?;
+        if padded_end > c.get_ref().len() {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "STUN attribute exceeds the message body",
+            ));
+        }
+        let value = &c.get_ref()[start..end];
+        c.set_position(padded_end as u64);
 
         match typ {
-            XOR_MAPPED_ADDRESS => {
-                let pos = c.position() as usize + 2;
-                let buf = c.get_mut();
-                let mut xor_buf = [0u8; 18];
-                xor_buf[0..2].copy_from_slice(&((MAGIC_COOKIE >> 16) as u16).to_be_bytes());
-                xor_buf[2..18].copy_from_slice(&buf[4..20]);
-                let n = ((len - 2) as usize).min(xor_buf.len()).min(buf.len() - pos);
-                for i in 0..n {
-                    buf[pos + i] ^= xor_buf[i];
-                }
-                Ok(Attribute::MappedAddress(Self::read_address(c)?))
-            }
-            MAPPED_ADDRESS => Ok(Attribute::MappedAddress(Self::read_address(c)?)),
-            RESPONSE_ADDRESS => Ok(Attribute::ResponseAddress(Self::read_address(c)?)),
-            CHANGED_ADDRESS => Ok(Attribute::ChangedAddress(Self::read_address(c)?)),
-            SOURCE_ADDRESS => Ok(Attribute::SourceAddress(Self::read_address(c)?)),
-            REFLECTED_FROM => Ok(Attribute::ReflectedFrom(Self::read_address(c)?)),
+            XOR_MAPPED_ADDRESS => Ok(Attribute::MappedAddress(Self::read_xor_address(
+                value, xor_key,
+            )?)),
+            MAPPED_ADDRESS => Ok(Attribute::MappedAddress(Self::read_address(value)?)),
+            RESPONSE_ADDRESS => Ok(Attribute::ResponseAddress(Self::read_address(value)?)),
+            CHANGED_ADDRESS => Ok(Attribute::ChangedAddress(Self::read_address(value)?)),
+            SOURCE_ADDRESS => Ok(Attribute::SourceAddress(Self::read_address(value)?)),
+            REFLECTED_FROM => Ok(Attribute::ReflectedFrom(Self::read_address(value)?)),
             MESSAGE_INTEGRITY => {
+                if value.len() != 20 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "STUN message-integrity attribute has an invalid length",
+                    ));
+                }
                 let mut hash = [0; 20];
-                c.read_exact(&mut hash)?;
+                hash.copy_from_slice(value);
                 Ok(Attribute::MessageIntegrity(hash))
             }
-            CHANGE_REQUEST => match c.read_u32::<NetworkEndian>()? {
-                CHANGE_REQUEST_IP => Ok(Attribute::ChangeRequest(ChangeRequest::Ip)),
-                CHANGE_REQUEST_PORT => Ok(Attribute::ChangeRequest(ChangeRequest::Port)),
-                CHANGE_REQUEST_IP_AND_PORT => {
-                    Ok(Attribute::ChangeRequest(ChangeRequest::IpAndPort))
+            CHANGE_REQUEST => match value {
+                [first, second, third, fourth] => {
+                    let value = u32::from_be_bytes([*first, *second, *third, *fourth]);
+                    match value {
+                        CHANGE_REQUEST_IP => Ok(Attribute::ChangeRequest(ChangeRequest::Ip)),
+                        CHANGE_REQUEST_PORT => Ok(Attribute::ChangeRequest(ChangeRequest::Port)),
+                        CHANGE_REQUEST_IP_AND_PORT => {
+                            Ok(Attribute::ChangeRequest(ChangeRequest::IpAndPort))
+                        }
+                        _ => Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "CHANGE_REQUEST not understood",
+                        )),
+                    }
                 }
                 _ => Err(Error::new(
                     ErrorKind::InvalidData,
-                    "CHANGE_REQUEST not understood",
+                    "STUN change-request attribute has an invalid length",
                 )),
             },
             _ if typ <= 0x7fff => Err(Error::new(
                 ErrorKind::InvalidData,
                 "Unknown mandatory field",
             )),
-            _ => {
-                c.seek(SeekFrom::Current(i64::from(len)))?;
-                Ok(Attribute::UnknownOptional)
-            }
+            _ => Ok(Attribute::UnknownOptional),
         }
     }
 
-    fn read_address(c: &mut Cursor<Vec<u8>>) -> Result<SocketAddr> {
-        let _ = c.read_u8()?;
-        let typ = c.read_u8()?;
-        let port = c.read_u16::<NetworkEndian>()?;
+    fn read_xor_address(value: &[u8], xor_key: &[u8; 16]) -> Result<SocketAddr> {
+        if value.len() < 4 {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "STUN XOR-MAPPED-ADDRESS is too short",
+            ));
+        }
 
-        match typ {
-            0x01 => {
-                let addr = c.read_u32::<NetworkEndian>()?;
-                let b0 = ((addr & 0xff00_0000) >> 24) as u8;
-                let b1 = ((addr & 0x00ff_0000) >> 16) as u8;
-                let b2 = ((addr & 0x0000_ff00) >> 8) as u8;
-                let b3 = (addr & 0x0000_00ff) as u8;
-                let ip = IpAddr::V4(Ipv4Addr::new(b0, b1, b2, b3));
-
-                Ok(SocketAddr::new(ip, port))
+        let port =
+            u16::from_be_bytes([value[2], value[3]]) ^ u16::from_be_bytes([xor_key[0], xor_key[1]]);
+        match value[1] {
+            0x01 if value.len() == 8 => {
+                let mut address = [0; 4];
+                for (index, byte) in address.iter_mut().enumerate() {
+                    *byte = value[index + 4] ^ xor_key[index];
+                }
+                Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(address)), port))
             }
-            0x02 => {
-                // Change to read 16 bytes.
-                let mut out = [0u8; 16];
-                c.read_exact(&mut out)?;
-                let ip = IpAddr::V6(Ipv6Addr::from(out));
-
-                Ok(SocketAddr::new(ip, port))
+            0x02 if value.len() == 20 => {
+                let mut address = [0; 16];
+                for (index, byte) in address.iter_mut().enumerate() {
+                    *byte = value[index + 4] ^ xor_key[index];
+                }
+                Ok(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(address)), port))
             }
+            0x01 | 0x02 => Err(Error::new(
+                ErrorKind::InvalidData,
+                "STUN XOR-MAPPED-ADDRESS has an invalid length",
+            )),
+            _ => Err(Error::new(
+                ErrorKind::InvalidData,
+                "Invalid STUN address family",
+            )),
+        }
+    }
+
+    fn read_address(value: &[u8]) -> Result<SocketAddr> {
+        if value.len() < 4 {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "STUN address attribute is too short",
+            ));
+        }
+        let port = u16::from_be_bytes([value[2], value[3]]);
+
+        match value[1] {
+            0x01 if value.len() == 8 => Ok(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(value[4], value[5], value[6], value[7])),
+                port,
+            )),
+            0x02 if value.len() == 20 => {
+                let mut address = [0; 16];
+                address.copy_from_slice(&value[4..]);
+                Ok(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(address)), port))
+            }
+            0x01 | 0x02 => Err(Error::new(
+                ErrorKind::InvalidData,
+                "STUN address attribute has an invalid length",
+            )),
             _ => Err(Error::new(ErrorKind::InvalidData, "Invalid address family")),
         }
     }
@@ -328,24 +390,30 @@ impl Attribute {
             Attribute::ReflectedFrom(ref s) => (REFLECTED_FROM, Self::encode_address(s)?),
             Attribute::MessageIntegrity(ref h) => (MESSAGE_INTEGRITY, h.to_vec()),
             Attribute::Username(ref u) => {
-                let total_len = (4.0 * (u.len() as f64 / 4.0).ceil()) as usize;
-                let padding_len = total_len - u.len();
+                let padding_len = (4 - (u.len() % 4)) % 4;
+                let total_len = u.len() + padding_len;
 
                 let mut buf = Vec::with_capacity(total_len);
                 buf.write_all(&u[..])?;
                 for _ in 0..padding_len {
                     buf.write_u8(0x00)?;
                 }
-                assert_eq!(buf.len(), total_len);
 
                 (USERNAME, buf)
             }
             Attribute::ChangeRequest(ref c) => (CHANGE_REQUEST, Self::encode_change_request(c)?),
-            Attribute::UnknownOptional => unreachable!(),
+            Attribute::UnknownOptional => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "cannot encode an unknown STUN attribute",
+                ));
+            }
         };
+        let opaque_length = u16::try_from(opaque.len())
+            .map_err(|_| Error::new(ErrorKind::InvalidInput, "STUN attribute is too large"))?;
 
         buf.write_u16::<NetworkEndian>(typ)?;
-        buf.write_u16::<NetworkEndian>(opaque.len() as u16)?;
+        buf.write_u16::<NetworkEndian>(opaque_length)?;
         buf.write_all(&opaque[..])?;
 
         Ok(())
@@ -462,5 +530,67 @@ mod tests {
         ];
 
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn decodes_a_standard_xor_mapped_address() {
+        let transaction_id = 0x0123_4567_89ab_cdef;
+        let mapped_address = SocketAddr::from(([203, 0, 113, 9], 3478));
+        let mut response = Vec::new();
+        response
+            .write_u16::<NetworkEndian>(BINDING_RESPONSE)
+            .unwrap();
+        response.write_u16::<NetworkEndian>(12).unwrap();
+        response
+            .write_u64::<NetworkEndian>((MAGIC_COOKIE as u64) << 32)
+            .unwrap();
+        response.write_u64::<NetworkEndian>(transaction_id).unwrap();
+        response
+            .write_u16::<NetworkEndian>(XOR_MAPPED_ADDRESS)
+            .unwrap();
+        response.write_u16::<NetworkEndian>(8).unwrap();
+        response.extend([0, 1]);
+        response
+            .write_u16::<NetworkEndian>(mapped_address.port() ^ (MAGIC_COOKIE >> 16) as u16)
+            .unwrap();
+        let cookie = MAGIC_COOKIE.to_be_bytes();
+        let std::net::IpAddr::V4(ip) = mapped_address.ip() else {
+            unreachable!();
+        };
+        response.extend(
+            ip.octets()
+                .into_iter()
+                .zip(cookie)
+                .map(|(ip, key)| ip ^ key),
+        );
+
+        let Some(Response::Bind(binding)) =
+            StunCodec::decode_const(transaction_id, response).unwrap()
+        else {
+            panic!("expected a binding response");
+        };
+
+        assert_eq!(binding.mapped_address, mapped_address);
+    }
+
+    #[test]
+    fn rejects_a_truncated_xor_mapped_address_without_panicking() {
+        let transaction_id = 0x0123_4567_89ab_cdef;
+        let mut response = Vec::new();
+        response
+            .write_u16::<NetworkEndian>(BINDING_RESPONSE)
+            .unwrap();
+        response.write_u16::<NetworkEndian>(8).unwrap();
+        response
+            .write_u64::<NetworkEndian>((MAGIC_COOKIE as u64) << 32)
+            .unwrap();
+        response.write_u64::<NetworkEndian>(transaction_id).unwrap();
+        response
+            .write_u16::<NetworkEndian>(XOR_MAPPED_ADDRESS)
+            .unwrap();
+        response.write_u16::<NetworkEndian>(1).unwrap();
+        response.extend([0, 0, 0, 0]);
+
+        assert!(StunCodec::decode_const(transaction_id, response).is_err());
     }
 }
