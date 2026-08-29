@@ -95,7 +95,8 @@ pub struct ConnectionFlags {
     #[arg(
         short,
         long,
-        help = "Set filter ipv6, so we would only connect to ipv4"
+        visible_alias = "ipv4-only",
+        help = "Only gather IPv4 candidates and reject IPv6 peer candidates"
     )]
     pub filter_ipv6: bool,
 

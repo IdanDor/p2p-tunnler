@@ -56,6 +56,16 @@ fn is_usable_peer_addr(addr: &SocketAddr) -> bool {
         && addr.port() > 1024
 }
 
+fn retained_known_connections(
+    known_connections: &HashSet<SocketAddr>,
+    only_ipv4: bool,
+) -> impl Iterator<Item = SocketAddr> + '_ {
+    known_connections
+        .iter()
+        .copied()
+        .filter(move |addr| !only_ipv4 || addr.ip().is_ipv4())
+}
+
 async fn create_local_receiever(lo_port: u16) -> anyhow::Result<UdpSocket> {
     Ok(UdpSocket::bind(("127.0.0.1", lo_port)).await?)
 }
@@ -75,13 +85,13 @@ async fn new_local_socket(
 
     let lo_sock = create_local_receiever(lo_port).await?;
     let local_addr = lo_sock.local_addr()?;
-    let (lo_sender, mut lo_receiver) = split_udp_socket(lo_sock);
+    let log_out = parent_log.new(slog::o!("direction" => "outbound"));
+    let (lo_sender, mut lo_receiver) = split_udp_socket(log_out.clone(), lo_sock);
     let local_addr_rw = Arc::new(RwLock::new((lo_sender, None)));
     let local_addr_rw_clone = local_addr_rw.clone();
     // let mut buf = vec![0u8; 64 * 1024];
 
-    let log_out = parent_log.new(slog::o!("direction" => "outbound"));
-    spawn(async move {
+    spawn(log_out.clone(), "loopback UDP forwarding", async move {
         // forward data from local socket (outbound wireguard) to the internet
         loop {
             // let (n, lo_peer_addr) = lo_receiver.recv_from(&mut buf).await?;
@@ -190,7 +200,10 @@ async fn dht_get(
 
         let known_connections = connections.read().await;
         if connection_flags.no_clear {
-            new_set.extend(&*known_connections);
+            new_set.extend(retained_known_connections(
+                &known_connections,
+                connection_flags.filter_ipv6,
+            ));
         }
         for remote_peer_addr in known_connections.difference(&new_set) {
             need_write = true;
@@ -261,11 +274,11 @@ async fn dht_put(
     Ok(())
 }
 
-fn split_inet_rx(mut rx: UdpReceiver) -> (UdpReceiver, UdpReceiver) {
+fn split_inet_rx(log: slog::Logger, mut rx: UdpReceiver) -> (UdpReceiver, UdpReceiver) {
     let (tx1, rx1) = mpsc::unbounded_channel();
     let (tx2, rx2) = mpsc::unbounded_channel();
 
-    spawn(async move {
+    spawn(log, "internet UDP receive routing", async move {
         loop {
             let Some((buf, dst)) = rx.recv().await else {
                 break Ok(());
@@ -349,8 +362,30 @@ struct StunLookup {
     from_inet_rx: UdpReceiver,
     public_address_s: Sender<Vec<SocketAddr>>,
     local_out_port: u16,
+    gather_ipv6: bool,
     nat_mapping: Option<nat::Mapping>,
     run_once: bool,
+}
+
+struct StunSetup {
+    to_inet_tx: UdpSender,
+    from_inet_rx: UdpReceiver,
+    local_out_port: u16,
+    gather_ipv6: bool,
+    nat_mapping: Option<nat::Mapping>,
+    run_once: bool,
+}
+
+fn local_ipv6_candidate(
+    local_ipv6: Option<IpAddr>,
+    local_out_port: u16,
+    gather_ipv6: bool,
+) -> Option<SocketAddr> {
+    if gather_ipv6 {
+        local_ipv6.map(|addr| SocketAddr::new(addr, local_out_port))
+    } else {
+        None
+    }
 }
 
 async fn lookup_public_address(lookup: StunLookup) -> anyhow::Result<()> {
@@ -361,6 +396,7 @@ async fn lookup_public_address(lookup: StunLookup) -> anyhow::Result<()> {
         mut from_inet_rx,
         public_address_s,
         local_out_port,
+        gather_ipv6,
         nat_mapping,
         run_once,
     } = lookup;
@@ -382,9 +418,14 @@ async fn lookup_public_address(lookup: StunLookup) -> anyhow::Result<()> {
         }
 
         let mut addr_vec = vec![];
-        if let Some(addr) = get_local_ipv6_addr().await? {
+        let local_ipv6 = if gather_ipv6 {
+            get_local_ipv6_addr().await?
+        } else {
+            None
+        };
+        if let Some(addr) = local_ipv6_candidate(local_ipv6, local_out_port, gather_ipv6) {
             // This hack is used so we can get the ipv6 out address, and connect to google servers in get_local_ipv6_addr, but without ruining our current socket, which cannot be unconnected easily.
-            addr_vec.push(SocketAddr::new(addr, local_out_port));
+            addr_vec.push(addr);
         }
 
         match stun
@@ -436,28 +477,40 @@ async fn lookup_public_address(lookup: StunLookup) -> anyhow::Result<()> {
 async fn setup_stun(
     log_dev: &slog::Logger,
     flags: &StunFlags,
-    to_inet_tx: UdpSender,
-    from_inet_rx: UdpReceiver,
-    local_out_port: u16,
-    nat_mapping: Option<nat::Mapping>,
-    run_once: bool,
+    setup: StunSetup,
 ) -> anyhow::Result<Receiver<Vec<SocketAddr>>> {
+    let StunSetup {
+        to_inet_tx,
+        from_inet_rx,
+        local_out_port,
+        gather_ipv6,
+        nat_mapping,
+        run_once,
+    } = setup;
     let log_stun = log_dev.new(slog::o!("traffic" => "stun"));
     let stun_server_addr = flags.stun_addr.clone();
     debug!(log_stun, "Stun starting resolving server"; "addr" => &stun_server_addr);
+    if !gather_ipv6 {
+        info!(log_stun, "IPv6 candidate gathering disabled");
+    }
     let (mut public_address_s, public_address_r) = broadcast::<Vec<SocketAddr>>(1);
     public_address_s.set_overflow(true);
 
-    spawn(lookup_public_address(StunLookup {
-        log: log_stun,
-        stun_server_addr,
-        to_inet_tx,
-        from_inet_rx,
-        public_address_s,
-        local_out_port,
-        nat_mapping,
-        run_once,
-    }));
+    spawn(
+        log_stun.clone(),
+        "STUN candidate gathering",
+        lookup_public_address(StunLookup {
+            log: log_stun,
+            stun_server_addr,
+            to_inet_tx,
+            from_inet_rx,
+            public_address_s,
+            local_out_port,
+            gather_ipv6,
+            nat_mapping,
+            run_once,
+        }),
+    );
 
     Ok(public_address_r)
 }
@@ -477,13 +530,8 @@ async fn handle_device(
     cfg: &P2PConnection,
     connection_flags: ConnectionFlags,
 ) -> anyhow::Result<()> {
-    let secret_key = SecretKey::try_from(cfg.secret_key.as_str()).map_err(|e| {
-        anyhow!(
-            "Failed to parse own secret key {}, with error: {}",
-            cfg.secret_key,
-            e
-        )
-    })?;
+    let secret_key = SecretKey::try_from(cfg.secret_key.as_str())
+        .map_err(|error| anyhow!("Failed to parse own secret key: {error}"))?;
 
     for peer in cfg.peers.iter() {
         let remote_pkey_base64 = peer.public_key.clone();
@@ -507,8 +555,8 @@ async fn handle_device(
         let (public_socket, local_out_port) =
             get_inet_socket(&log_peer, connection_flags.out_port).await?;
 
-        let (to_inet_tx, from_inet_rx) = split_udp_socket(public_socket);
-        let (stun_rx, data_inet_rx) = split_inet_rx(from_inet_rx);
+        let (to_inet_tx, from_inet_rx) = split_udp_socket(log_peer.clone(), public_socket);
+        let (stun_rx, data_inet_rx) = split_inet_rx(log_peer.clone(), from_inet_rx);
         let nat_mapping = if connection_flags.nat_map {
             info!(log_peer, "Requesting local-router UDP mapping"; "local_port" => local_out_port);
             match nat::map_udp_port(log_peer.clone(), local_out_port).await {
@@ -536,11 +584,14 @@ async fn handle_device(
         let public_address_r = setup_stun(
             &log_peer,
             stun_flags,
-            to_inet_tx.clone(),
-            stun_rx,
-            local_out_port,
-            nat_mapping,
-            false,
+            StunSetup {
+                to_inet_tx: to_inet_tx.clone(),
+                from_inet_rx: stun_rx,
+                local_out_port,
+                gather_ipv6: !connection_flags.filter_ipv6,
+                nat_mapping,
+                run_once: false,
+            },
         )
         .await?;
 
@@ -552,30 +603,37 @@ async fn handle_device(
         let local_pair =
             new_local_socket(log_out, to_inet_tx, lo_port, connections.clone()).await?;
         let log_fwd = log_peer.new(slog::o!("traffic" => "inbound"));
-        spawn(forward_inbound_traffic(
-            log_fwd,
-            data_inet_rx,
-            connections.clone(),
-            local_pair,
-        ));
+        spawn(
+            log_fwd.clone(),
+            "inbound UDP forwarding",
+            forward_inbound_traffic(log_fwd, data_inet_rx, connections.clone(), local_pair),
+        );
         let log_put = log_peer.new(slog::o!("dht" => "put"));
         let log_get = log_peer.new(slog::o!("dht" => "get"));
 
-        spawn(dht_put(
-            log_put,
-            dht.clone(),
-            secret_key.clone(),
-            remote_pkey.clone(),
-            public_address_r,
-        ));
-        spawn(dht_get(
-            log_get,
-            dht.clone(),
-            secret_key.clone(),
-            remote_pkey,
-            connections,
-            connection_flags.clone(),
-        ));
+        spawn(
+            log_put.clone(),
+            "DHT address publishing",
+            dht_put(
+                log_put,
+                dht.clone(),
+                secret_key.clone(),
+                remote_pkey.clone(),
+                public_address_r,
+            ),
+        );
+        spawn(
+            log_get.clone(),
+            "DHT address listening",
+            dht_get(
+                log_get,
+                dht.clone(),
+                secret_key.clone(),
+                remote_pkey,
+                connections,
+                connection_flags.clone(),
+            ),
+        );
     }
 
     Ok(())
@@ -696,16 +754,19 @@ async fn async_main() -> anyhow::Result<()> {
             let log_dev = log.new(slog::o!("dev" => "stun"));
 
             let (public_socket, local_out_port) = get_inet_socket(&log_dev, 0).await?;
-            let (to_inet_tx, from_inet_rx) = split_udp_socket(public_socket);
+            let (to_inet_tx, from_inet_rx) = split_udp_socket(log_dev.clone(), public_socket);
 
             let mut public_address_r = setup_stun(
                 &log_dev,
                 flags,
-                to_inet_tx,
-                from_inet_rx,
-                local_out_port,
-                None,
-                true,
+                StunSetup {
+                    to_inet_tx,
+                    from_inet_rx,
+                    local_out_port,
+                    gather_ipv6: true,
+                    nat_mapping: None,
+                    run_once: true,
+                },
             )
             .await?;
 
@@ -758,9 +819,10 @@ async fn async_main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dht_key, is_usable_peer_addr};
+    use super::{dht_key, is_usable_peer_addr, local_ipv6_candidate, retained_known_connections};
     use crate::crypto::PublicKey;
-    use std::net::SocketAddr;
+    use std::collections::HashSet;
+    use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
     #[test]
     fn accepts_the_full_unprivileged_port_range() {
@@ -780,5 +842,27 @@ mod tests {
             dht_key(&publisher, &subscriber),
             [[0x11; 32], [0x22; 32]].concat()
         );
+    }
+
+    #[test]
+    fn ipv4_only_mode_does_not_publish_a_local_ipv6_candidate() {
+        let ipv6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+
+        assert_eq!(local_ipv6_candidate(Some(ipv6), 12345, false), None);
+        assert_eq!(
+            local_ipv6_candidate(Some(ipv6), 12345, true),
+            Some(SocketAddr::new(ipv6, 12345))
+        );
+    }
+
+    #[test]
+    fn ipv4_only_mode_does_not_retain_an_old_ipv6_peer() {
+        let ipv4 = SocketAddr::from(([192, 0, 2, 1], 12345));
+        let ipv6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 12345);
+        let known_connections = HashSet::from([ipv4, ipv6]);
+
+        let retained: HashSet<_> = retained_known_connections(&known_connections, true).collect();
+
+        assert_eq!(retained, HashSet::from([ipv4]));
     }
 }

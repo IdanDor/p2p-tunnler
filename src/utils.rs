@@ -5,14 +5,13 @@ use std::sync::Arc;
 use futures::StreamExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-pub fn spawn<F>(future: F)
+pub fn spawn<F>(log: slog::Logger, task: &'static str, future: F)
 where
     F: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-    tokio::spawn(async {
-        if let Err(e) = future.await {
-            unimplemented!("Task failed: {:?}", e);
-            //            todo!() //error!("Task failed: {:?}", e);
+    tokio::spawn(async move {
+        if let Err(error) = future.await {
+            slog::error!(log, "Background task stopped"; "task" => task, "error" => format!("{error:#}"));
         }
     });
 }
@@ -32,14 +31,17 @@ pub fn batches<T: Unpin, S: futures::Stream<Item = T> + Unpin>(
 pub type UdpSender = UnboundedSender<(Vec<u8>, SocketAddr)>;
 pub type UdpReceiver = UnboundedReceiver<(bytes::Bytes, SocketAddr)>;
 
-pub fn split_udp_socket(sock: tokio::net::UdpSocket) -> (UdpSender, UdpReceiver) {
+pub fn split_udp_socket(
+    log: slog::Logger,
+    sock: tokio::net::UdpSocket,
+) -> (UdpSender, UdpReceiver) {
     let (tx1, mut rx2) = tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, SocketAddr)>();
     let (tx2, rx1) = tokio::sync::mpsc::unbounded_channel::<(bytes::Bytes, SocketAddr)>();
 
     let sock = Arc::new(sock);
     let sock1 = sock.clone();
 
-    spawn(async move {
+    spawn(log.clone(), "UDP socket receiver", async move {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             let (n, peer) = sock.recv_from(&mut buf).await?;
@@ -48,10 +50,14 @@ pub fn split_udp_socket(sock: tokio::net::UdpSocket) -> (UdpSender, UdpReceiver)
         }
     });
 
-    spawn(async move {
+    spawn(log, "UDP socket sender", async move {
         while let Some((buf, dst)) = rx2.recv().await {
             let n = sock1.send_to(&buf[..], dst).await?;
-            assert_eq!(buf.len(), n);
+            anyhow::ensure!(
+                n == buf.len(),
+                "UDP socket sent {n} bytes of a {}-byte datagram",
+                buf.len()
+            );
         }
         Ok(())
     });
@@ -73,7 +79,8 @@ mod tests {
             .block_on(async {
                 let tunnel_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
                 let tunnel_addr = tunnel_socket.local_addr()?;
-                let (to_socket, mut from_socket) = split_udp_socket(tunnel_socket);
+                let log = slog::Logger::root(slog::Discard, slog::o!());
+                let (to_socket, mut from_socket) = split_udp_socket(log, tunnel_socket);
                 let peer_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
                 let peer_addr = peer_socket.local_addr()?;
 
