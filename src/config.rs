@@ -143,10 +143,20 @@ pub struct RunCommand {
     pub connections: Vec<P2PConnection>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct P2PConnection {
     pub secret_key: String,
     pub peers: Vec<Peer>,
+}
+
+impl std::fmt::Debug for P2PConnection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("P2PConnection")
+            .field("secret_key", &"<redacted>")
+            .field("peers", &self.peers)
+            .finish()
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -193,5 +203,22 @@ impl CliConfig {
         }
 
         Ok(cli)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::P2PConnection;
+
+    #[test]
+    fn debug_output_redacts_the_secret_key() {
+        let connection = P2PConnection {
+            secret_key: "not-a-real-secret".to_string(),
+            peers: vec![],
+        };
+
+        let debug_output = format!("{connection:?}");
+        assert!(debug_output.contains("<redacted>"));
+        assert!(!debug_output.contains(&connection.secret_key));
     }
 }
