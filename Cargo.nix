@@ -495,22 +495,7 @@ rec {
         };
         resolvedDefaultFeatures = [ "default" "std" ];
       };
-      "bytes 0.6.0" = rec {
-        crateName = "bytes";
-        version = "0.6.0";
-        edition = "2018";
-        sha256 = "05ivrcbgl4f7z2zzm9hbsi8cy66spi70xlm6fp16zsq4ylsvrp70";
-        authors = [
-          "Carl Lerche <me@carllerche.com>"
-          "Sean McArthur <sean@seanmonstar.com>"
-        ];
-        features = {
-          "default" = [ "std" ];
-          "serde" = [ "dep:serde" ];
-        };
-        resolvedDefaultFeatures = [ "default" "std" ];
-      };
-      "bytes 1.12.1" = rec {
+      "bytes" = rec {
         crateName = "bytes";
         version = "1.12.1";
         edition = "2021";
@@ -1119,7 +1104,7 @@ rec {
         dependencies = [
           {
             name = "bytes";
-            packageId = "bytes 1.12.1";
+            packageId = "bytes";
           }
           {
             name = "displaydoc";
@@ -1131,7 +1116,7 @@ rec {
           }
           {
             name = "rand";
-            packageId = "rand 0.10.2";
+            packageId = "rand";
           }
           {
             name = "thiserror";
@@ -2100,7 +2085,6 @@ rec {
           "rustc-dep-of-std" = [ "compiler_builtins" "core" "libc/rustc-dep-of-std" "wasi/rustc-dep-of-std" ];
           "wasm-bindgen" = [ "dep:wasm-bindgen" ];
         };
-        resolvedDefaultFeatures = [ "std" ];
       };
       "getrandom 0.4.3" = rec {
         crateName = "getrandom";
@@ -2306,7 +2290,7 @@ rec {
         dependencies = [
           {
             name = "bytes";
-            packageId = "bytes 1.12.1";
+            packageId = "bytes";
           }
           {
             name = "itoa";
@@ -2764,7 +2748,7 @@ rec {
           }
           {
             name = "rand";
-            packageId = "rand 0.10.2";
+            packageId = "rand";
           }
           {
             name = "url";
@@ -2954,19 +2938,6 @@ rec {
           }
         ];
 
-      };
-      "lazy_static" = rec {
-        crateName = "lazy_static";
-        version = "1.5.0";
-        edition = "2015";
-        sha256 = "1zk6dqqni0193xg6iijh7i3i44sryglwgvx20spdvwk3r6sbrlmv";
-        authors = [
-          "Marvin Löbel <loebel.marvin@gmail.com>"
-        ];
-        features = {
-          "spin" = [ "dep:spin" ];
-          "spin_no_std" = [ "spin" ];
-        };
       };
       "libc" = rec {
         crateName = "libc";
@@ -3399,7 +3370,7 @@ rec {
           }
           {
             name = "bytes";
-            packageId = "bytes 0.6.0";
+            packageId = "bytes";
           }
           {
             name = "clap";
@@ -3427,17 +3398,12 @@ rec {
             packageId = "igd-next";
           }
           {
-            name = "lazy_static";
-            packageId = "lazy_static";
-          }
-          {
             name = "opendht";
             packageId = "opendht";
           }
           {
             name = "rand";
-            packageId = "rand 0.8.6";
-            features = [ "small_rng" ];
+            packageId = "rand";
           }
           {
             name = "serde";
@@ -3720,27 +3686,6 @@ rec {
           "std" = [ "alloc" ];
         };
       };
-      "ppv-lite86" = rec {
-        crateName = "ppv-lite86";
-        version = "0.2.21";
-        edition = "2021";
-        sha256 = "1abxx6qz5qnd43br1dd9b2savpihzjza8gb4fbzdql1gxp2f7sl5";
-        libName = "ppv_lite86";
-        authors = [
-          "The CryptoCorrosion Contributors"
-        ];
-        dependencies = [
-          {
-            name = "zerocopy";
-            packageId = "zerocopy";
-            features = [ "simd" ];
-          }
-        ];
-        features = {
-          "default" = [ "std" ];
-        };
-        resolvedDefaultFeatures = [ "simd" "std" ];
-      };
       "proc-macro-crate" = rec {
         crateName = "proc-macro-crate";
         version = "3.5.0";
@@ -3813,7 +3758,7 @@ rec {
           "rustc-dep-of-std" = [ "core" ];
         };
       };
-      "rand 0.10.2" = rec {
+      "rand" = rec {
         crateName = "rand";
         version = "0.10.2";
         edition = "2024";
@@ -3852,77 +3797,6 @@ rec {
         };
         resolvedDefaultFeatures = [ "alloc" "default" "std" "std_rng" "sys_rng" "thread_rng" ];
       };
-      "rand 0.8.6" = rec {
-        crateName = "rand";
-        version = "0.8.6";
-        edition = "2018";
-        sha256 = "12kd4rljn86m00rcaz4c1rcya4mb4gk5ig6i8xq00a8wjgxfr82w";
-        authors = [
-          "The Rand Project Developers"
-          "The Rust Project Developers"
-        ];
-        dependencies = [
-          {
-            name = "libc";
-            packageId = "libc";
-            optional = true;
-            usesDefaultFeatures = false;
-            target = { target, features }: (target."unix" or false);
-          }
-          {
-            name = "rand_chacha";
-            packageId = "rand_chacha";
-            optional = true;
-            usesDefaultFeatures = false;
-          }
-          {
-            name = "rand_core";
-            packageId = "rand_core 0.6.4";
-          }
-        ];
-        features = {
-          "alloc" = [ "rand_core/alloc" ];
-          "default" = [ "std" "std_rng" ];
-          "getrandom" = [ "rand_core/getrandom" ];
-          "libc" = [ "dep:libc" ];
-          "rand_chacha" = [ "dep:rand_chacha" ];
-          "serde" = [ "dep:serde" ];
-          "serde1" = [ "serde" "rand_core/serde1" ];
-          "std" = [ "rand_core/std" "rand_chacha/std" "alloc" "getrandom" "libc" ];
-          "std_rng" = [ "rand_chacha" ];
-        };
-        resolvedDefaultFeatures = [ "alloc" "default" "getrandom" "libc" "rand_chacha" "small_rng" "std" "std_rng" ];
-      };
-      "rand_chacha" = rec {
-        crateName = "rand_chacha";
-        version = "0.3.1";
-        edition = "2018";
-        sha256 = "123x2adin558xbhvqb8w4f6syjsdkmqff8cxwhmjacpsl1ihmhg6";
-        authors = [
-          "The Rand Project Developers"
-          "The Rust Project Developers"
-          "The CryptoCorrosion Contributors"
-        ];
-        dependencies = [
-          {
-            name = "ppv-lite86";
-            packageId = "ppv-lite86";
-            usesDefaultFeatures = false;
-            features = [ "simd" ];
-          }
-          {
-            name = "rand_core";
-            packageId = "rand_core 0.6.4";
-          }
-        ];
-        features = {
-          "default" = [ "std" ];
-          "serde" = [ "dep:serde" ];
-          "serde1" = [ "serde" ];
-          "std" = [ "ppv-lite86/std" ];
-        };
-        resolvedDefaultFeatures = [ "std" ];
-      };
       "rand_core 0.10.1" = rec {
         crateName = "rand_core";
         version = "0.10.1";
@@ -3955,7 +3829,7 @@ rec {
           "serde1" = [ "serde" ];
           "std" = [ "alloc" "getrandom" "getrandom/std" ];
         };
-        resolvedDefaultFeatures = [ "alloc" "getrandom" "std" ];
+        resolvedDefaultFeatures = [ "getrandom" ];
       };
       "ring" = rec {
         crateName = "ring";
@@ -5030,7 +4904,7 @@ rec {
         dependencies = [
           {
             name = "bytes";
-            packageId = "bytes 1.12.1";
+            packageId = "bytes";
             optional = true;
           }
           {
@@ -6512,77 +6386,6 @@ rec {
           {
             name = "synstructure";
             packageId = "synstructure";
-          }
-        ];
-
-      };
-      "zerocopy" = rec {
-        crateName = "zerocopy";
-        version = "0.8.50";
-        edition = "2021";
-        sha256 = "1laahnfxs4qyfb1fdf5nbb2qfshi72b1hbi0ffp2zy2m1r7ms1iv";
-        authors = [
-          "Joshua Liebow-Feeser <joshlf@google.com>"
-          "Jack Wrenn <jswrenn@amazon.com>"
-        ];
-        dependencies = [
-          {
-            name = "zerocopy-derive";
-            packageId = "zerocopy-derive";
-            optional = true;
-          }
-          {
-            name = "zerocopy-derive";
-            packageId = "zerocopy-derive";
-            target = { target, features }: false;
-          }
-        ];
-        devDependencies = [
-          {
-            name = "zerocopy-derive";
-            packageId = "zerocopy-derive";
-          }
-        ];
-        features = {
-          "__internal_use_only_features_that_work_on_stable" = [ "alloc" "derive" "simd" "std" ];
-          "derive" = [ "zerocopy-derive" ];
-          "simd-nightly" = [ "simd" ];
-          "std" = [ "alloc" ];
-          "zerocopy-derive" = [ "dep:zerocopy-derive" ];
-        };
-        resolvedDefaultFeatures = [ "simd" ];
-      };
-      "zerocopy-derive" = rec {
-        crateName = "zerocopy-derive";
-        version = "0.8.50";
-        edition = "2021";
-        sha256 = "0fdnr9qslx1hbn2i9rsvy9s95mychfy2vj90ajsjm2basccinqqb";
-        procMacro = true;
-        libName = "zerocopy_derive";
-        authors = [
-          "Joshua Liebow-Feeser <joshlf@google.com>"
-          "Jack Wrenn <jswrenn@amazon.com>"
-        ];
-        dependencies = [
-          {
-            name = "proc-macro2";
-            packageId = "proc-macro2";
-          }
-          {
-            name = "quote";
-            packageId = "quote";
-          }
-          {
-            name = "syn";
-            packageId = "syn 2.0.117";
-            features = [ "full" ];
-          }
-        ];
-        devDependencies = [
-          {
-            name = "syn";
-            packageId = "syn 2.0.117";
-            features = [ "visit" ];
           }
         ];
 

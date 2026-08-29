@@ -7,11 +7,11 @@ use slog::{debug, info};
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
+use std::sync::LazyLock;
 use std::time::Duration;
 use std::time::Instant;
 
-use rand::Rng;
-use rand::SeedableRng;
+use rand::{RngExt, rngs::SmallRng};
 
 use tokio::sync::Mutex;
 
@@ -21,9 +21,7 @@ use crate::stun::codec::*;
 use crate::utils::UdpReceiver;
 use crate::utils::UdpSender;
 
-lazy_static::lazy_static! {
-    static ref RNG: Mutex<rand::rngs::SmallRng> = Mutex::new(rand::rngs::SmallRng::from_entropy());
-}
+static RNG: LazyLock<Mutex<SmallRng>> = LazyLock::new(|| Mutex::new(rand::make_rng()));
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Connectivity {
@@ -190,7 +188,7 @@ async fn send_request(
     req: Request,
 ) -> Result<Option<Response>, anyhow::Error> {
     let mut lock = RNG.lock().await;
-    let id: u64 = lock.r#gen();
+    let id: u64 = lock.random();
 
     let mut buf = bytes::BytesMut::new();
     StunCodec::encode((id, req.clone()), &mut buf)?;
