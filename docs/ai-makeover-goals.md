@@ -28,3 +28,24 @@ living document: new goals may be added and priorities may change.
 10. Document the repository well and make it easy to work on safely with AI:
     maintain useful project and AI guidance, organize durable documentation in
     `docs/`, and keep instructions current as the architecture evolves.
+
+## Version 0.2.0 status
+
+The agreed modernization scope is implemented in focused, reviewed commits:
+
+- Tokio replaces `async-std`; `crypto_box` replaces `sodiumoxide` with a
+  byte-for-byte legacy crypto fixture.
+- DHT key ordering, JSON representation, encrypted payload handling, UDP
+  forwarding, IPv4-only behavior, malformed DHT/STUN input, and secret
+  redaction have regression coverage.
+- `--filter-ipv6` now also prevents local IPv6 publication and has the clearer
+  `--ipv4-only` alias. Direct local-router mapping is available with
+  `--nat-map`.
+- Direct dependencies and the corresponding Cargo/Nix graphs have been
+  updated, and durable architecture, operations, compatibility, development,
+  and AI-workflow documentation now lives under `docs/`.
+
+The deliberately deferred ICE-style candidate-pair protocol described in
+`direct-only-nat-traversal.md` is not a safe drop-in refactor: it would change
+the legacy DHT value and peer behavior. It requires an explicitly designed,
+backwards-compatible migration and must not be folded into routine cleanup.
