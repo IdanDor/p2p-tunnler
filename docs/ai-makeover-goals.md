@@ -14,10 +14,8 @@ living document: new goals may be added and priorities may change.
 3. Replace the deprecated `async-std` runtime with a maintained alternative.
    Tokio is the selected runtime because the NAT-mapping dependency already
    requires it and its event-loop model avoids operating two runtimes.
-4. Evaluate replacing `sodiumoxide` with `crypto_box`. Make the change only if
-   its cryptographic construction, wire representation, and key handling can
-   remain compatible with version 0.1.0; otherwise retain a compatibility
-   layer or defer the replacement.
+4. Replace `sodiumoxide` with `crypto_box` while preserving version 0.1.0
+   cryptographic construction, wire representation, and key handling.
 5. Update project dependencies deliberately, with compatibility and security
    review rather than indiscriminate version bumps.
 6. Maintain a high Rust engineering standard comparable to the Sysarmor

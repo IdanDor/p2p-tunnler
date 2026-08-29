@@ -14,7 +14,7 @@ use std::time::SystemTime;
 
 use std::convert::{TryFrom, TryInto};
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow};
 use async_broadcast::{Receiver, RecvError, Sender, broadcast};
 use tokio::net::UdpSocket;
 use tokio::sync::{RwLock, mpsc};
@@ -41,7 +41,10 @@ type RwAddrConnections = RwLock<HashSet<SocketAddr>>;
 type RwLocalAddr = RwLock<(UdpSender, Option<SocketAddr>)>;
 
 fn dht_key(publisher: &PublicKey, subscriber: &PublicKey) -> Vec<u8> {
-    [publisher.0.0, subscriber.0.0].concat()
+    let mut key = Vec::with_capacity(64);
+    key.extend_from_slice(publisher.as_bytes());
+    key.extend_from_slice(subscriber.as_bytes());
+    key
 }
 
 fn is_usable_peer_addr(addr: &SocketAddr) -> bool {
@@ -115,7 +118,7 @@ async fn dht_get(
 ) -> anyhow::Result<()> {
     let secret_key = private_key;
     let local_pkey = secret_key.public_key();
-    let crypto = Sodiumoxide::new(&remote_pkey, &secret_key);
+    let crypto = CryptoBox::new(&remote_pkey, &secret_key);
 
     let key = dht_key(&remote_pkey, &local_pkey);
     debug!(log_get, "Waiting for remote peer to publish IP in DHT..."; "dht_key" => general_purpose::STANDARD.encode(&key));
@@ -217,7 +220,7 @@ async fn dht_put(
 ) -> anyhow::Result<()> {
     let secret_key = private_key;
     let local_pkey = secret_key.public_key();
-    let crypto = Sodiumoxide::new(&remote_pkey, &secret_key);
+    let crypto = CryptoBox::new(&remote_pkey, &secret_key);
 
     let key = dht_key(&local_pkey, &remote_pkey);
     info!(log_put, "Will publish own public address on DHT"; "dht_key" => general_purpose::STANDARD.encode(&key));
@@ -648,10 +651,6 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main() -> anyhow::Result<()> {
-    if let Err(()) = sodiumoxide::init() {
-        bail!("Initializing sodiumoxide failed");
-    }
-
     let cfg = CliConfig::new()?;
 
     let decorator = slog_term::TermDecorator::new().build();
