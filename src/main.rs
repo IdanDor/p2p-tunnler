@@ -118,6 +118,16 @@ async fn new_local_socket(
     Ok(local_addr_rw_clone)
 }
 
+fn parse_dht_message(log: &slog::Logger, plaintext: &[u8]) -> Option<Message> {
+    match serde_json::from_slice(plaintext) {
+        Ok(message) => Some(message),
+        Err(error) => {
+            info!(log, "Invalid DHT message ignored"; "error" => format!("{error:#}"));
+            None
+        }
+    }
+}
+
 async fn dht_get(
     log_get: slog::Logger,
     dht: OpenDht,
@@ -137,56 +147,33 @@ async fn dht_get(
 
     let mut last_timestamp: Option<SystemTime> = None;
 
-    let listen = batches(dht.listen(key.clone()));
-    futures::pin_mut!(listen);
-    while let Some(batch) = listen.next().await {
-        // TODO: need secret key for PublicKeyCrypto
-        let batch: Vec<_> = batch.collect();
-        let batch = batch.into_iter();
+    let mut listen = dht.listen(key.clone());
+    while let Some(value) = listen.next().await {
+        let Some(plaintext) = crypto.decrypt(&value) else {
+            debug!(log_get, "DHT value decryption failed");
+            continue;
+        };
+        let Some(msg) = parse_dht_message(&log_get, &plaintext) else {
+            continue;
+        };
 
-        let batch = batch
-            .map(|value| crypto.decrypt(&value[..]))
-            .filter_map(|value| {
-                if value.is_none() {
-                    debug!(log_get, "Decryption failed")
-                };
-                value
-            });
-
-        let batch: Vec<_> = batch.collect();
-        let batch = batch.into_iter();
-
-        let batch = batch
-            .map(|value| serde_json::from_slice::<Message>(&value[..]))
-            .filter_map(|value| {
-                if value.is_err() {
-                    info!(log_get, "Deserialization failed")
-                };
-                value.ok()
-            });
-        let batch: Vec<_> = batch.collect();
-        let batch = batch.into_iter();
-
-        let msg = batch.max_by_key(|m| m.timestamp);
-
-        let a = msg.as_ref().and_then(|m| {
-            m.timestamp
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .ok()
-        });
+        let message_timestamp = msg
+            .timestamp
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .ok();
         let b = last_timestamp.as_ref().and_then(|t| {
             t.duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .ok()
         });
-        debug!(log_get, "msg_ts < last_ts?"; "msg_ts" => a, "last_ts" => b);
-        if msg.as_ref().map(|m| m.timestamp) < last_timestamp {
-            debug!(log_get, "skipping"; "msg_ts" => a, "last_ts" => b);
+        debug!(log_get, "DHT message timestamp compared"; "message_timestamp" => message_timestamp, "last_timestamp" => b);
+        if last_timestamp.is_some_and(|last| msg.timestamp < last) {
+            debug!(log_get, "Ignoring stale DHT message"; "message_timestamp" => message_timestamp, "last_timestamp" => b);
             continue;
         }
-        last_timestamp = msg.as_ref().map(|m| m.timestamp);
-        let mut ip_addr_list = msg.map(|m| m.ip_addr_list).unwrap_or(vec![]);
+        last_timestamp = Some(msg.timestamp);
+        let mut ip_addr_list = msg.ip_addr_list;
 
         if connection_flags.filter_ipv6 {
             ip_addr_list.retain(|addr| addr.ip().is_ipv4());
@@ -819,7 +806,10 @@ async fn async_main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dht_key, is_usable_peer_addr, local_ipv6_candidate, retained_known_connections};
+    use super::{
+        dht_key, is_usable_peer_addr, local_ipv6_candidate, parse_dht_message,
+        retained_known_connections,
+    };
     use crate::crypto::PublicKey;
     use std::collections::HashSet;
     use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -864,5 +854,12 @@ mod tests {
         let retained: HashSet<_> = retained_known_connections(&known_connections, true).collect();
 
         assert_eq!(retained, HashSet::from([ipv4]));
+    }
+
+    #[test]
+    fn malformed_dht_messages_are_ignored() {
+        let log = slog::Logger::root(slog::Discard, slog::o!());
+
+        assert!(parse_dht_message(&log, br#"{"timestamp":{}}"#).is_none());
     }
 }

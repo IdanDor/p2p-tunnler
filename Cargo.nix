@@ -314,58 +314,6 @@ rec {
         ];
 
       };
-      "async-stream" = rec {
-        crateName = "async-stream";
-        version = "0.3.6";
-        edition = "2021";
-        sha256 = "0xl4zqncrdmw2g6241wgr11dxdg4h7byy6bz3l6si03qyfk72nhb";
-        libName = "async_stream";
-        authors = [
-          "Carl Lerche <me@carllerche.com>"
-        ];
-        dependencies = [
-          {
-            name = "async-stream-impl";
-            packageId = "async-stream-impl";
-          }
-          {
-            name = "futures-core";
-            packageId = "futures-core";
-          }
-          {
-            name = "pin-project-lite";
-            packageId = "pin-project-lite";
-          }
-        ];
-
-      };
-      "async-stream-impl" = rec {
-        crateName = "async-stream-impl";
-        version = "0.3.6";
-        edition = "2021";
-        sha256 = "0kaplfb5axsvf1gfs2gk6c4zx6zcsns0yf3ssk7iwni7bphlvhn7";
-        procMacro = true;
-        libName = "async_stream_impl";
-        authors = [
-          "Carl Lerche <me@carllerche.com>"
-        ];
-        dependencies = [
-          {
-            name = "proc-macro2";
-            packageId = "proc-macro2";
-          }
-          {
-            name = "quote";
-            packageId = "quote";
-          }
-          {
-            name = "syn";
-            packageId = "syn 2.0.117";
-            features = [ "full" "visit-mut" ];
-          }
-        ];
-
-      };
       "async-trait" = rec {
         crateName = "async-trait";
         version = "0.1.89";
@@ -3440,14 +3388,6 @@ rec {
           {
             name = "async-broadcast";
             packageId = "async-broadcast";
-          }
-          {
-            name = "async-stream";
-            packageId = "async-stream";
-          }
-          {
-            name = "async-trait";
-            packageId = "async-trait";
           }
           {
             name = "base64";

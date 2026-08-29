@@ -2,7 +2,6 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use futures::StreamExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 pub fn spawn<F>(log: slog::Logger, task: &'static str, future: F)
@@ -14,18 +13,6 @@ where
             slog::error!(log, "Background task stopped"; "task" => task, "error" => format!("{error:#}"));
         }
     });
-}
-
-pub fn batches<T: Unpin, S: futures::Stream<Item = T> + Unpin>(
-    mut stream: S,
-) -> impl futures::Stream<Item = impl Iterator<Item = T>> {
-    async_stream::stream! {
-        loop {
-            while let Some(res) = stream.next().await {
-                yield vec![res].into_iter();
-            }
-        }
-    }
 }
 
 pub type UdpSender = UnboundedSender<(Vec<u8>, SocketAddr)>;
