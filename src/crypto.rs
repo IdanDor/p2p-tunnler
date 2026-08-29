@@ -39,14 +39,17 @@ pub fn generate_secret_key_base64() -> (SecretKey, String, PublicKey) {
 impl Sodiumoxide {
     pub fn encrypt(&self, plaintext: &[u8]) -> anyhow::Result<bytes::Bytes> {
         let nonce = box_::gen_nonce();
+        Ok(self.encrypt_with_nonce(plaintext, &nonce))
+    }
 
-        let ciphertext = box_::seal_precomputed(plaintext, &nonce, &self.0);
+    fn encrypt_with_nonce(&self, plaintext: &[u8], nonce: &box_::Nonce) -> bytes::Bytes {
+        let ciphertext = box_::seal_precomputed(plaintext, nonce, &self.0);
 
         let mut buf = bytes::BytesMut::new();
         buf.put(&nonce.0[..]);
         buf.put(&ciphertext[..]);
 
-        Ok(buf.freeze())
+        buf.freeze()
     }
 
     pub fn decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
@@ -127,5 +130,37 @@ impl TryFrom<&str> for SecretKey {
         let mut array = [0u8; 32];
         array.copy_from_slice(&bytes);
         Ok(SecretKey::new(array))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEGACY_CRYPTO_BOX_FIXTURE: &str =
+        "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzpWED4HGlH8yRoxt9BCfpllp5qfjdkM0Y6OY7RfCMsjCPcg==";
+
+    #[test]
+    fn matches_the_legacy_crypto_box_fixture() {
+        sodiumoxide::init().unwrap();
+        let our_secret = SecretKey::new([0x11; 32]);
+        let their_secret = SecretKey::new([0x22; 32]);
+        let their_public = their_secret.public_key();
+        let crypto = Sodiumoxide::new(&their_public, &our_secret);
+        let nonce = box_::Nonce([0x33; NONCEBYTES]);
+
+        let encrypted = crypto.encrypt_with_nonce(b"legacy DHT fixture", &nonce);
+        assert_eq!(
+            general_purpose::STANDARD.encode(&encrypted),
+            LEGACY_CRYPTO_BOX_FIXTURE
+        );
+
+        let fixture = general_purpose::STANDARD
+            .decode(LEGACY_CRYPTO_BOX_FIXTURE)
+            .unwrap();
+        assert_eq!(
+            crypto.decrypt(&fixture).as_deref(),
+            Some(b"legacy DHT fixture".as_slice())
+        );
     }
 }

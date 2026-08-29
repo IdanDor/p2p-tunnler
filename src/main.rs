@@ -40,6 +40,10 @@ use std::os::unix::fs::PermissionsExt;
 type RwAddrConnections = RwLock<HashSet<SocketAddr>>;
 type RwLocalAddr = RwLock<(UdpSender, Option<SocketAddr>)>;
 
+fn dht_key(publisher: &PublicKey, subscriber: &PublicKey) -> Vec<u8> {
+    [publisher.0.0, subscriber.0.0].concat()
+}
+
 fn is_usable_peer_addr(addr: &SocketAddr) -> bool {
     // TODO: When address.is_global() is stable, just use that; this is missing many edge cases.
     !addr.ip().is_loopback()
@@ -111,7 +115,7 @@ async fn dht_get(
     let local_pkey = secret_key.public_key();
     let crypto = Sodiumoxide::new(&remote_pkey, &secret_key);
 
-    let key = [remote_pkey.0.0, local_pkey.0.0].concat();
+    let key = dht_key(&remote_pkey, &local_pkey);
     debug!(log_get, "Waiting for remote peer to publish IP in DHT..."; "dht_key" => general_purpose::STANDARD.encode(&key));
 
     // TODO: if not found within X seconds, repeat
@@ -170,10 +174,7 @@ async fn dht_get(
         let mut ip_addr_list = msg.map(|m| m.ip_addr_list).unwrap_or(vec![]);
 
         if connection_flags.filter_ipv6 {
-            ip_addr_list = ip_addr_list
-                .into_iter()
-                .filter(|addr| addr.ip().is_ipv4())
-                .collect();
+            ip_addr_list.retain(|addr| addr.ip().is_ipv4());
         }
 
         let mut new_set: HashSet<_> = ip_addr_list
@@ -207,7 +208,8 @@ async fn dht_get(
 
 #[cfg(test)]
 mod tests {
-    use super::is_usable_peer_addr;
+    use super::{dht_key, is_usable_peer_addr};
+    use crate::crypto::PublicKey;
     use std::net::SocketAddr;
 
     #[test]
@@ -217,6 +219,17 @@ mod tests {
         assert!(!is_usable_peer_addr(&SocketAddr::from((ip, 1024))));
         assert!(is_usable_peer_addr(&SocketAddr::from((ip, 1025))));
         assert!(is_usable_peer_addr(&SocketAddr::from((ip, u16::MAX))));
+    }
+
+    #[test]
+    fn derives_the_legacy_dht_key_in_publisher_order() {
+        let publisher = PublicKey::new([0x11; 32]);
+        let subscriber = PublicKey::new([0x22; 32]);
+
+        assert_eq!(
+            dht_key(&publisher, &subscriber),
+            [[0x11; 32], [0x22; 32]].concat()
+        );
     }
 }
 
@@ -231,7 +244,7 @@ async fn dht_put(
     let local_pkey = secret_key.public_key();
     let crypto = Sodiumoxide::new(&remote_pkey, &secret_key);
 
-    let key = [local_pkey.0.0, remote_pkey.0.0].concat();
+    let key = dht_key(&local_pkey, &remote_pkey);
     info!(log_put, "Will publish own public address on DHT"; "dht_key" => general_purpose::STANDARD.encode(&key));
 
     debug!(log_put, "Starting to wait for new public address");
@@ -248,7 +261,7 @@ async fn dht_put(
                 continue;
             }
         };
-        let public_addrs_str = format!("{:?}", &public_addrs);
+        let public_addrs_str = format!("{:?}", public_addrs);
         debug!(log_put, "Got myown a new public addresses"; "addrs" => &public_addrs_str);
 
         let msg = Message {
@@ -349,16 +362,28 @@ async fn get_local_ipv6_addr() -> anyhow::Result<Option<IpAddr>> {
     Ok(None)
 }
 
-async fn lookup_public_address(
+struct StunLookup {
     log: slog::Logger,
     stun_server_addr: String,
-    mut to_inet_tx: UdpSender,
-    mut from_inet_rx: UdpReceiver,
+    to_inet_tx: UdpSender,
+    from_inet_rx: UdpReceiver,
     public_address_s: Sender<Vec<SocketAddr>>,
     local_out_port: u16,
     nat_mapping: Option<nat::Mapping>,
     run_once: bool,
-) -> anyhow::Result<()> {
+}
+
+async fn lookup_public_address(lookup: StunLookup) -> anyhow::Result<()> {
+    let StunLookup {
+        log,
+        stun_server_addr,
+        mut to_inet_tx,
+        mut from_inet_rx,
+        public_address_s,
+        local_out_port,
+        nat_mapping,
+        run_once,
+    } = lookup;
     let stun = stun::Stun;
     let mut old_address = vec![];
     let mut old_server_address = None;
@@ -366,7 +391,7 @@ async fn lookup_public_address(
         // Resolve address here in case it changes over runtime.
         let stun_addrs: Vec<_> = stun_server_addr.to_socket_addrs().await?.collect();
         // Only connect to ipv4 addresses of STUN servers, as IPv6 NAT doesn't actually exist.
-        let stun_addrs_str = format!("{:?}", &stun_addrs);
+        let stun_addrs_str = format!("{:?}", stun_addrs);
         let stun_server = stun_addrs
             .into_iter()
             .find(|a| a.is_ipv4())
@@ -406,7 +431,7 @@ async fn lookup_public_address(
                     addr_vec.push(addr);
                 }
                 if old_address != addr_vec {
-                    let addr_vec_str = format!("{:?}", &addr_vec);
+                    let addr_vec_str = format!("{:?}", addr_vec);
                     info!(log, "STUN found new addresses"; "addr" => addr_vec_str);
                     old_address = addr_vec.clone();
                 }
@@ -443,8 +468,8 @@ async fn setup_stun(
     let (mut public_address_s, public_address_r) = broadcast::<Vec<SocketAddr>>(1);
     public_address_s.set_overflow(true);
 
-    spawn(lookup_public_address(
-        log_stun,
+    spawn(lookup_public_address(StunLookup {
+        log: log_stun,
         stun_server_addr,
         to_inet_tx,
         from_inet_rx,
@@ -452,7 +477,7 @@ async fn setup_stun(
         local_out_port,
         nat_mapping,
         run_once,
-    ));
+    }));
 
     Ok(public_address_r)
 }
@@ -661,7 +686,7 @@ async fn main() -> anyhow::Result<()> {
     match cfg.command {
         Command::Generate { ref flags } => {
             let (sk, sk_base64, pk) = generate_secret_key_base64();
-            let (priv_file, pub_file) = get_generate_file(&flags)?;
+            let (priv_file, pub_file) = get_generate_file(flags)?;
 
             if let Some(mut file) = priv_file {
                 file.write_all(sk_base64.as_bytes())
