@@ -1,6 +1,4 @@
-use async_std::net::ToSocketAddrs;
-use async_std::prelude::*;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -13,12 +11,12 @@ impl OpenDht {
     pub async fn new(
         log: slog::Logger,
         listen_port: u16,
-        bootstrap_servers: impl ToSocketAddrs,
+        bootstrap_servers: impl tokio::net::ToSocketAddrs,
     ) -> anyhow::Result<OpenDht> {
         let dht = opendht::OpenDht::new(listen_port)?;
         let dht = Arc::new(dht);
 
-        let servers: Vec<SocketAddr> = bootstrap_servers.to_socket_addrs().await?.collect();
+        let servers: Vec<SocketAddr> = tokio::net::lookup_host(bootstrap_servers).await?.collect();
         slog::debug!(log, "OpenDHT bootstrapping...");
         if dht.bootstrap(&servers).await.is_err() {
             anyhow::bail!("Failed to bootstrap using {:?}", servers);
@@ -26,9 +24,9 @@ impl OpenDht {
         slog::info!(log, "OpenDHT bootstrapping done");
 
         let dht2 = dht.clone();
-        async_std::task::spawn(async move {
+        tokio::spawn(async move {
             while let Some(next) = dht2.tick() {
-                async_std::task::sleep(next).await;
+                tokio::time::sleep(next).await;
             }
             slog::crit!(log, "OpenDHT loop ended!");
         });

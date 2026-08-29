@@ -11,8 +11,9 @@ living document: new goals may be added and priorities may change.
    This includes the existing DHT message format, key handling, address
    exchange, and UDP/WireGuard forwarding behaviour unless a compatible
    migration is explicitly designed and tested.
-3. Replace the deprecated `async-std` runtime with a maintained alternative,
-   likely `smol`, after confirming the best fit for the project.
+3. Replace the deprecated `async-std` runtime with a maintained alternative.
+   Tokio is the selected runtime because the NAT-mapping dependency already
+   requires it and its event-loop model avoids operating two runtimes.
 4. Evaluate replacing `sodiumoxide` with `crypto_box`. Make the change only if
    its cryptographic construction, wire representation, and key handling can
    remain compatible with version 0.1.0; otherwise retain a compatibility

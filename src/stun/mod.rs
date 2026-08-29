@@ -13,8 +13,7 @@ use std::time::Instant;
 use rand::Rng;
 use rand::SeedableRng;
 
-use async_std::prelude::*;
-use async_std::sync::Mutex;
+use tokio::sync::Mutex;
 
 //pub const NETWORK_UNREACHABLE: i32 = 101;
 
@@ -195,20 +194,20 @@ async fn send_request(
 
     let mut buf = bytes::BytesMut::new();
     StunCodec::encode((id, req.clone()), &mut buf)?;
-    to_inet_tx.send((buf.to_vec(), stun_server)).await?;
+    to_inet_tx.send((buf.to_vec(), stun_server))?;
 
     let start = Instant::now();
 
     loop {
         let dur = Duration::from_secs(3).checked_sub(Instant::now() - start);
         let dur = dur.unwrap_or(Duration::from_secs(0));
-        match async_std::future::timeout(dur, from_inet_rx.next()).await {
-            Err(e) => {
-                debug!(stun_log, "Error getting inet stun packet {:?}", e);
+        match tokio::time::timeout(dur, from_inet_rx.recv()).await {
+            Err(_) => {
+                debug!(stun_log, "STUN request timed out");
                 break;
             }
             Ok(None) => {
-                debug!(stun_log, "Stun did not get a packet, got Ok(None)");
+                debug!(stun_log, "STUN socket receiver closed");
                 break;
             }
             Ok(Some((buf, _src))) => {

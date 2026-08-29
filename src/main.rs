@@ -7,7 +7,7 @@ mod stun;
 mod utils;
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -16,8 +16,8 @@ use std::convert::{TryFrom, TryInto};
 
 use anyhow::{Context, anyhow, bail};
 use async_broadcast::{Receiver, RecvError, Sender, broadcast};
-use async_std::net::{IpAddr, ToSocketAddrs, UdpSocket};
-use async_std::sync::RwLock;
+use tokio::net::UdpSocket;
+use tokio::sync::{RwLock, mpsc};
 
 use slog::{Drain, Level, LevelFilter};
 use slog::{crit, debug, error, info};
@@ -72,7 +72,7 @@ async fn new_local_socket(
 
     let lo_sock = create_local_receiever(lo_port).await?;
     let local_addr = lo_sock.local_addr()?;
-    let (lo_sender, lo_receiver) = split_udp_socket(lo_sock);
+    let (lo_sender, mut lo_receiver) = split_udp_socket(lo_sock);
     let local_addr_rw = Arc::new(RwLock::new((lo_sender, None)));
     let local_addr_rw_clone = local_addr_rw.clone();
     // let mut buf = vec![0u8; 64 * 1024];
@@ -82,7 +82,9 @@ async fn new_local_socket(
         // forward data from local socket (outbound wireguard) to the internet
         loop {
             // let (n, lo_peer_addr) = lo_receiver.recv_from(&mut buf).await?;
-            let (buf, lo_peer_addr) = lo_receiver.recv().await?;
+            let Some((buf, lo_peer_addr)) = lo_receiver.recv().await else {
+                break Ok(());
+            };
             let n = buf.len();
 
             if local_addr_rw.read().await.1 != Some(lo_peer_addr) {
@@ -94,7 +96,7 @@ async fn new_local_socket(
             for remote_peer_addr in guard.iter() {
                 // lo_peer_addr must be wireguard on localhost
                 // to_inet_tx.send((buf[..n].to_vec(), *remote_peer_addr)).await?;
-                to_inet_tx.send((buf.to_vec(), *remote_peer_addr)).await?;
+                to_inet_tx.send((buf.to_vec(), *remote_peer_addr))?;
                 debug!(log_out, "Outbound packet forwarded"; "src" => lo_peer_addr, "via_lo" => local_addr, "dst" => remote_peer_addr, "bytes" => n);
             }
         }
@@ -206,33 +208,6 @@ async fn dht_get(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{dht_key, is_usable_peer_addr};
-    use crate::crypto::PublicKey;
-    use std::net::SocketAddr;
-
-    #[test]
-    fn accepts_the_full_unprivileged_port_range() {
-        let ip = [192, 0, 2, 1];
-
-        assert!(!is_usable_peer_addr(&SocketAddr::from((ip, 1024))));
-        assert!(is_usable_peer_addr(&SocketAddr::from((ip, 1025))));
-        assert!(is_usable_peer_addr(&SocketAddr::from((ip, u16::MAX))));
-    }
-
-    #[test]
-    fn derives_the_legacy_dht_key_in_publisher_order() {
-        let publisher = PublicKey::new([0x11; 32]);
-        let subscriber = PublicKey::new([0x22; 32]);
-
-        assert_eq!(
-            dht_key(&publisher, &subscriber),
-            [[0x11; 32], [0x22; 32]].concat()
-        );
-    }
-}
-
 async fn dht_put(
     log_put: slog::Logger,
     dht: OpenDht,
@@ -283,20 +258,22 @@ async fn dht_put(
     Ok(())
 }
 
-fn split_inet_rx(rx: UdpReceiver) -> (UdpReceiver, UdpReceiver) {
-    let (tx1, rx1) = async_std::channel::unbounded();
-    let (tx2, rx2) = async_std::channel::unbounded();
+fn split_inet_rx(mut rx: UdpReceiver) -> (UdpReceiver, UdpReceiver) {
+    let (tx1, rx1) = mpsc::unbounded_channel();
+    let (tx2, rx2) = mpsc::unbounded_channel();
 
     spawn(async move {
         loop {
-            let (buf, dst) = rx.recv().await?;
+            let Some((buf, dst)) = rx.recv().await else {
+                break Ok(());
+            };
             // Only send "stun packets" to first channel, and do not send to the second.
             if buf.len() > 20
                 && u64::from_be_bytes(buf[4..12].try_into().unwrap()) == (MAGIC_COOKIE as u64) << 32
             {
-                tx1.send((buf.clone(), dst)).await?;
+                tx1.send((buf.clone(), dst))?;
             } else {
-                tx2.send((buf, dst)).await?;
+                tx2.send((buf, dst))?;
             }
         }
     });
@@ -310,7 +287,7 @@ async fn forward_inbound_traffic(
     connections: Arc<RwAddrConnections>,
     local_pair: Arc<RwLocalAddr>,
 ) -> anyhow::Result<()> {
-    while let Some((buf, remote_peer_addr)) = from_inet_rx.next().await {
+    while let Some((buf, remote_peer_addr)) = from_inet_rx.recv().await {
         debug!(log_fwd, "Received inbound packet"; "src" => remote_peer_addr, "bytes" => buf.len());
 
         let read_set = connections.read().await;
@@ -325,7 +302,7 @@ async fn forward_inbound_traffic(
         let lo_socket = &guard.0;
         let lo_peer_addr = guard.1;
         if let Some(lo_peer_addr) = lo_peer_addr {
-            lo_socket.send((buf.to_vec(), lo_peer_addr)).await?;
+            lo_socket.send((buf.to_vec(), lo_peer_addr))?;
             debug!(log_fwd, "Forwarded inbound packet"; "remote_addr" => remote_peer_addr, "lo_addr" => lo_peer_addr);
         } else {
             debug!(
@@ -389,7 +366,7 @@ async fn lookup_public_address(lookup: StunLookup) -> anyhow::Result<()> {
     let mut old_server_address = None;
     loop {
         // Resolve address here in case it changes over runtime.
-        let stun_addrs: Vec<_> = stun_server_addr.to_socket_addrs().await?.collect();
+        let stun_addrs: Vec<_> = tokio::net::lookup_host(&stun_server_addr).await?.collect();
         // Only connect to ipv4 addresses of STUN servers, as IPv6 NAT doesn't actually exist.
         let stun_addrs_str = format!("{:?}", stun_addrs);
         let stun_server = stun_addrs
@@ -437,13 +414,13 @@ async fn lookup_public_address(lookup: StunLookup) -> anyhow::Result<()> {
                 }
                 public_address_s.broadcast_direct(addr_vec).await?;
                 debug!(log, "STUN all tasks notified"; "addr" => addr);
-                async_std::task::sleep(Duration::from_secs(60)).await;
+                tokio::time::sleep(Duration::from_secs(60)).await;
             }
             Err(err) => {
                 error!(log, "STUN failed"; "error" => format!("{:?}", err));
                 // Send an empty vector, or possibly our optional extra addr.
                 public_address_s.broadcast_direct(addr_vec).await?;
-                async_std::task::sleep(Duration::from_secs(15)).await;
+                tokio::time::sleep(Duration::from_secs(15)).await;
             }
         }
 
@@ -663,8 +640,14 @@ fn get_generate_file(flags: &GenFlags) -> anyhow::Result<(Option<File>, Option<F
     Ok((file, pub_file))
 }
 
-#[async_std::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     if let Err(()) = sodiumoxide::init() {
         bail!("Initializing sodiumoxide failed");
     }
@@ -766,10 +749,37 @@ async fn main() -> anyhow::Result<()> {
                 crit!(log, "No connections configured!");
             } else {
                 results.into_iter().collect::<anyhow::Result<()>>()?;
-                async_std::future::pending::<()>().await;
+                std::future::pending::<()>().await;
             }
         }
     };
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dht_key, is_usable_peer_addr};
+    use crate::crypto::PublicKey;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn accepts_the_full_unprivileged_port_range() {
+        let ip = [192, 0, 2, 1];
+
+        assert!(!is_usable_peer_addr(&SocketAddr::from((ip, 1024))));
+        assert!(is_usable_peer_addr(&SocketAddr::from((ip, 1025))));
+        assert!(is_usable_peer_addr(&SocketAddr::from((ip, u16::MAX))));
+    }
+
+    #[test]
+    fn derives_the_legacy_dht_key_in_publisher_order() {
+        let publisher = PublicKey::new([0x11; 32]);
+        let subscriber = PublicKey::new([0x22; 32]);
+
+        assert_eq!(
+            dht_key(&publisher, &subscriber),
+            [[0x11; 32], [0x22; 32]].concat()
+        );
+    }
 }

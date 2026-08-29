@@ -2,20 +2,19 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use async_std::channel::{Receiver, Sender};
-use async_std::prelude::*;
+use futures::StreamExt;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 pub fn spawn<F>(future: F)
 where
     F: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-    let _handle = async_std::task::spawn(async {
+    tokio::spawn(async {
         if let Err(e) = future.await {
             unimplemented!("Task failed: {:?}", e);
             //            todo!() //error!("Task failed: {:?}", e);
         }
     });
-    // TODO: what to do with handle?
 }
 
 pub fn batches<T: Unpin, S: futures::Stream<Item = T> + Unpin>(
@@ -30,12 +29,12 @@ pub fn batches<T: Unpin, S: futures::Stream<Item = T> + Unpin>(
     }
 }
 
-pub type UdpSender = Sender<(Vec<u8>, SocketAddr)>;
-pub type UdpReceiver = Receiver<(bytes::Bytes, SocketAddr)>;
+pub type UdpSender = UnboundedSender<(Vec<u8>, SocketAddr)>;
+pub type UdpReceiver = UnboundedReceiver<(bytes::Bytes, SocketAddr)>;
 
-pub fn split_udp_socket(sock: async_std::net::UdpSocket) -> (UdpSender, UdpReceiver) {
-    let (tx1, rx2) = async_std::channel::unbounded();
-    let (tx2, rx1) = async_std::channel::unbounded();
+pub fn split_udp_socket(sock: tokio::net::UdpSocket) -> (UdpSender, UdpReceiver) {
+    let (tx1, mut rx2) = tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, SocketAddr)>();
+    let (tx2, rx1) = tokio::sync::mpsc::unbounded_channel::<(bytes::Bytes, SocketAddr)>();
 
     let sock = Arc::new(sock);
     let sock1 = sock.clone();
@@ -45,17 +44,60 @@ pub fn split_udp_socket(sock: async_std::net::UdpSocket) -> (UdpSender, UdpRecei
         loop {
             let (n, peer) = sock.recv_from(&mut buf).await?;
             let b = bytes::Bytes::copy_from_slice(&buf[..n]);
-            tx2.send((b, peer)).await?
+            tx2.send((b, peer))?
         }
     });
 
     spawn(async move {
-        loop {
-            let (buf, dst): (Vec<u8>, SocketAddr) = rx2.recv().await?;
+        while let Some((buf, dst)) = rx2.recv().await {
             let n = sock1.send_to(&buf[..], dst).await?;
             assert_eq!(buf.len(), n);
         }
+        Ok(())
     });
 
     (tx1, rx1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_udp_socket;
+    use anyhow::Context;
+    use std::time::Duration;
+
+    #[test]
+    fn forwards_datagrams_in_both_directions() -> anyhow::Result<()> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let tunnel_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+                let tunnel_addr = tunnel_socket.local_addr()?;
+                let (to_socket, mut from_socket) = split_udp_socket(tunnel_socket);
+                let peer_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+                let peer_addr = peer_socket.local_addr()?;
+
+                to_socket.send((b"outbound".to_vec(), peer_addr))?;
+                let mut buffer = [0; 64];
+                let (len, source) = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    peer_socket.recv_from(&mut buffer),
+                )
+                .await
+                .context("timed out waiting for the outbound datagram")??;
+                assert_eq!(&buffer[..len], b"outbound");
+                assert_eq!(source, tunnel_addr);
+
+                peer_socket.send_to(b"inbound", tunnel_addr).await?;
+                let (packet, source) =
+                    tokio::time::timeout(Duration::from_secs(1), from_socket.recv())
+                        .await
+                        .context("timed out waiting for the inbound datagram")?
+                        .context("UDP receiver closed before forwarding the inbound datagram")?;
+                assert_eq!(&packet[..], b"inbound");
+                assert_eq!(source, peer_addr);
+
+                Ok(())
+            })
+    }
 }

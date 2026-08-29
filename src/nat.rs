@@ -55,12 +55,12 @@ pub async fn map_udp_port(log: slog::Logger, port: u16) -> anyhow::Result<Mappin
         .spawn(move || mapping_worker(log, port, sender))
         .context("Failed to start NAT mapping worker")?;
 
-    async_std::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         receiver
             .recv()
             .map_err(|_| anyhow!("NAT mapping worker stopped before returning a result"))?
     })
-    .await
+    .await?
 }
 
 fn mapping_worker(

@@ -26,11 +26,10 @@ rand = { version = "0.8.0", features = ["small_rng"] }
 lazy_static = "1.4.0"
 
 
-async-std = { version = "1.13", features = ["attributes"] }
 async-broadcast = "0.7"
 crab_nat = "0.8.1"
 igd-next = "0.17.1"
-tokio = { version = "1.52", features = ["rt", "net", "time"] }
+tokio = { version = "1.52", features = ["rt", "net", "sync", "time"] }
 
 # opendht = { path = "../opendht-rs" }
 opendht = { git = "https://github.com/IdanDor/opendht.git" }
