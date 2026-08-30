@@ -8,6 +8,8 @@
   constraints for direct connectivity without a traffic relay.
 - [Architecture](architecture.md): data/control-plane boundaries and runtime
   responsibilities.
+- [Code map](code-map.md): source-module ownership and compatibility-sensitive
+  change entry points.
 - [Operations guide](operations.md): configuration, flags, and connectivity
   diagnosis.
 - [Development and AI-assisted work](development.md): validation, dependency,
