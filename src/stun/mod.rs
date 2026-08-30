@@ -1,6 +1,6 @@
 pub mod codec;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 
 use slog::{debug, info};
 
@@ -18,8 +18,7 @@ use tokio::sync::Mutex;
 //pub const NETWORK_UNREACHABLE: i32 = 101;
 
 use crate::stun::codec::*;
-use crate::utils::UdpReceiver;
-use crate::utils::UdpSender;
+use crate::utils::{UdpReceiver, UdpSender, try_send};
 
 static RNG: LazyLock<Mutex<SmallRng>> = LazyLock::new(|| Mutex::new(rand::make_rng()));
 
@@ -192,7 +191,9 @@ async fn send_request(
 
     let mut buf = bytes::BytesMut::new();
     StunCodec::encode((id, req.clone()), &mut buf)?;
-    to_inet_tx.send((buf.to_vec(), stun_server))?;
+    if !try_send(to_inet_tx, (buf.to_vec(), stun_server))? {
+        bail!("STUN request dropped because the UDP send queue is full");
+    }
 
     let start = Instant::now();
 

@@ -38,6 +38,10 @@ checkout. Never commit `.cargo/`. Also preserve the pinned OpenDHT
 `Cargo.lock`; a local path patch can cause Cargo to omit it during local
 builds.
 
+Run `cargo audit` when updating dependencies. The dependency graph is expected
+to be free of RustSec advisories; update both `Cargo.lock` and `Cargo.nix` for
+any remediation.
+
 ## Required review
 
 Each focused implementation change must be tested and adversarially reviewed

@@ -7,20 +7,21 @@ mod stun;
 mod utils;
 
 use std::collections::HashSet;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 
 use std::convert::{TryFrom, TryInto};
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use async_broadcast::{Receiver, RecvError, Sender, broadcast};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::{RwLock, mpsc};
 
 use slog::{Drain, Level, LevelFilter};
-use slog::{crit, debug, error, info};
+use slog::{debug, error, info};
 
 use base64::{Engine, engine::general_purpose};
 use config::{CliConfig, Command, ConnectionFlags, DhtFlags, GenFlags, P2PConnection, StunFlags};
@@ -35,7 +36,7 @@ use utils::{UdpReceiver, UdpSender};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 type RwAddrConnections = RwLock<HashSet<SocketAddr>>;
 type RwLocalAddr = RwLock<(UdpSender, Option<SocketAddr>)>;
@@ -76,6 +77,7 @@ async fn create_local_receiever(lo_port: u16) -> anyhow::Result<UdpSocket> {
 ///
 /// public_socket: public internet socket
 async fn new_local_socket(
+    monitor: TaskMonitor,
     parent_log: slog::Logger,
     to_inet_tx: UdpSender,
     lo_port: u16,
@@ -86,34 +88,39 @@ async fn new_local_socket(
     let lo_sock = create_local_receiever(lo_port).await?;
     let local_addr = lo_sock.local_addr()?;
     let log_out = parent_log.new(slog::o!("direction" => "outbound"));
-    let (lo_sender, mut lo_receiver) = split_udp_socket(log_out.clone(), lo_sock);
+    let (lo_sender, mut lo_receiver) = split_udp_socket(monitor.clone(), log_out.clone(), lo_sock);
     let local_addr_rw = Arc::new(RwLock::new((lo_sender, None)));
     let local_addr_rw_clone = local_addr_rw.clone();
     // let mut buf = vec![0u8; 64 * 1024];
 
-    spawn(log_out.clone(), "loopback UDP forwarding", async move {
-        // forward data from local socket (outbound wireguard) to the internet
-        loop {
-            // let (n, lo_peer_addr) = lo_receiver.recv_from(&mut buf).await?;
-            let Some((buf, lo_peer_addr)) = lo_receiver.recv().await else {
-                break Ok(());
-            };
-            let n = buf.len();
+    spawn(
+        monitor,
+        log_out.clone(),
+        "loopback UDP forwarding",
+        async move {
+            // forward data from local socket (outbound wireguard) to the internet
+            loop {
+                // let (n, lo_peer_addr) = lo_receiver.recv_from(&mut buf).await?;
+                let Some((buf, lo_peer_addr)) = lo_receiver.recv().await else {
+                    break Ok(());
+                };
+                let n = buf.len();
 
-            if local_addr_rw.read().await.1 != Some(lo_peer_addr) {
-                info!(log_out, "lo_peer_addr changed, it is now..."; "lo_peer_addr" => lo_peer_addr);
-                local_addr_rw.write().await.1 = Some(lo_peer_addr);
-            }
+                if local_addr_rw.read().await.1 != Some(lo_peer_addr) {
+                    info!(log_out, "lo_peer_addr changed, it is now..."; "lo_peer_addr" => lo_peer_addr);
+                    local_addr_rw.write().await.1 = Some(lo_peer_addr);
+                }
 
-            let guard = remote_peer_addrs.read().await;
-            for remote_peer_addr in guard.iter() {
-                // lo_peer_addr must be wireguard on localhost
-                // to_inet_tx.send((buf[..n].to_vec(), *remote_peer_addr)).await?;
-                to_inet_tx.send((buf.to_vec(), *remote_peer_addr))?;
-                debug!(log_out, "Outbound packet forwarded"; "src" => lo_peer_addr, "via_lo" => local_addr, "dst" => remote_peer_addr, "bytes" => n);
+                let guard = remote_peer_addrs.read().await;
+                for remote_peer_addr in guard.iter() {
+                    // lo_peer_addr must be wireguard on localhost
+                    // to_inet_tx.send((buf[..n].to_vec(), *remote_peer_addr)).await?;
+                    let _ = try_send(&to_inet_tx, (buf.to_vec(), *remote_peer_addr))?;
+                    debug!(log_out, "Outbound packet forwarded"; "src" => lo_peer_addr, "via_lo" => local_addr, "dst" => remote_peer_addr, "bytes" => n);
+                }
             }
-        }
-    });
+        },
+    );
 
     Ok(local_addr_rw_clone)
 }
@@ -208,7 +215,7 @@ async fn dht_get(
         debug!(log_get, "Waiting for remote peer to publish a new IP in DHT..."; "dht_key" => general_purpose::STANDARD.encode(&key));
     }
 
-    Ok(())
+    bail!("DHT listener ended")
 }
 
 async fn dht_put(
@@ -230,7 +237,7 @@ async fn dht_put(
     loop {
         let public_addrs: Vec<SocketAddr> = match public_address_r.recv().await {
             Ok(addrs) => addrs,
-            Err(RecvError::Closed) => break,
+            Err(RecvError::Closed) => bail!("STUN candidate source stopped"),
             Err(RecvError::Overflowed(_)) => {
                 debug!(
                     log_put,
@@ -257,15 +264,17 @@ async fn dht_put(
         //     debug!(log_put, "Republishing old address..."; "addr" => public_addr);
         // }
     }
-
-    Ok(())
 }
 
-fn split_inet_rx(log: slog::Logger, mut rx: UdpReceiver) -> (UdpReceiver, UdpReceiver) {
-    let (tx1, rx1) = mpsc::unbounded_channel();
-    let (tx2, rx2) = mpsc::unbounded_channel();
+fn split_inet_rx(
+    monitor: TaskMonitor,
+    log: slog::Logger,
+    mut rx: UdpReceiver,
+) -> (UdpReceiver, UdpReceiver) {
+    let (tx1, rx1) = mpsc::channel(UDP_QUEUE_CAPACITY);
+    let (tx2, rx2) = mpsc::channel(UDP_QUEUE_CAPACITY);
 
-    spawn(log, "internet UDP receive routing", async move {
+    spawn(monitor, log, "internet UDP receive routing", async move {
         loop {
             let Some((buf, dst)) = rx.recv().await else {
                 break Ok(());
@@ -274,9 +283,9 @@ fn split_inet_rx(log: slog::Logger, mut rx: UdpReceiver) -> (UdpReceiver, UdpRec
             if buf.len() > 20
                 && u64::from_be_bytes(buf[4..12].try_into().unwrap()) == (MAGIC_COOKIE as u64) << 32
             {
-                tx1.send((buf.clone(), dst))?;
+                let _ = try_send(&tx1, (buf, dst))?;
             } else {
-                tx2.send((buf, dst))?;
+                let _ = try_send(&tx2, (buf, dst))?;
             }
         }
     });
@@ -305,7 +314,7 @@ async fn forward_inbound_traffic(
         let lo_socket = &guard.0;
         let lo_peer_addr = guard.1;
         if let Some(lo_peer_addr) = lo_peer_addr {
-            lo_socket.send((buf.to_vec(), lo_peer_addr))?;
+            let _ = try_send(lo_socket, (buf.to_vec(), lo_peer_addr))?;
             debug!(log_fwd, "Forwarded inbound packet"; "remote_addr" => remote_peer_addr, "lo_addr" => lo_peer_addr);
         } else {
             debug!(
@@ -355,6 +364,7 @@ struct StunLookup {
 }
 
 struct StunSetup {
+    monitor: TaskMonitor,
     to_inet_tx: UdpSender,
     from_inet_rx: UdpReceiver,
     local_out_port: u16,
@@ -467,6 +477,7 @@ async fn setup_stun(
     setup: StunSetup,
 ) -> anyhow::Result<Receiver<Vec<SocketAddr>>> {
     let StunSetup {
+        monitor,
         to_inet_tx,
         from_inet_rx,
         local_out_port,
@@ -484,6 +495,7 @@ async fn setup_stun(
     public_address_s.set_overflow(true);
 
     spawn(
+        monitor,
         log_stun.clone(),
         "STUN candidate gathering",
         lookup_public_address(StunLookup {
@@ -503,7 +515,16 @@ async fn setup_stun(
 }
 
 async fn get_inet_socket(log: &slog::Logger, out_port: u16) -> anyhow::Result<(UdpSocket, u16)> {
-    let public_socket = UdpSocket::bind(("::", out_port)).await?;
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    socket
+        .set_only_v6(false)
+        .context("Enabling dual-stack IPv4/IPv6 UDP support failed")?;
+    socket.bind(&socket2::SockAddr::from(SocketAddr::new(
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        out_port,
+    )))?;
+    socket.set_nonblocking(true)?;
+    let public_socket = UdpSocket::from_std(socket.into())?;
     let local_addr = public_socket.local_addr()?;
     info!(log, "Creating device udp socket"; "address" => local_addr);
 
@@ -511,6 +532,7 @@ async fn get_inet_socket(log: &slog::Logger, out_port: u16) -> anyhow::Result<(U
 }
 
 async fn handle_device(
+    monitor: TaskMonitor,
     log_dev: slog::Logger,
     dht: OpenDht,
     stun_flags: &StunFlags,
@@ -542,8 +564,10 @@ async fn handle_device(
         let (public_socket, local_out_port) =
             get_inet_socket(&log_peer, connection_flags.out_port).await?;
 
-        let (to_inet_tx, from_inet_rx) = split_udp_socket(log_peer.clone(), public_socket);
-        let (stun_rx, data_inet_rx) = split_inet_rx(log_peer.clone(), from_inet_rx);
+        let (to_inet_tx, from_inet_rx) =
+            split_udp_socket(monitor.clone(), log_peer.clone(), public_socket);
+        let (stun_rx, data_inet_rx) =
+            split_inet_rx(monitor.clone(), log_peer.clone(), from_inet_rx);
         let nat_mapping = if connection_flags.nat_map {
             info!(log_peer, "Requesting local-router UDP mapping"; "local_port" => local_out_port);
             match nat::map_udp_port(log_peer.clone(), local_out_port).await {
@@ -572,6 +596,7 @@ async fn handle_device(
             &log_peer,
             stun_flags,
             StunSetup {
+                monitor: monitor.clone(),
                 to_inet_tx: to_inet_tx.clone(),
                 from_inet_rx: stun_rx,
                 local_out_port,
@@ -587,10 +612,17 @@ async fn handle_device(
         let lo_port = peer.local_port;
         debug!(log_peer, "Connection local port is"; "port" => lo_port);
         let log_out = log_peer.new(slog::o!("traffic" => "outbound"));
-        let local_pair =
-            new_local_socket(log_out, to_inet_tx, lo_port, connections.clone()).await?;
+        let local_pair = new_local_socket(
+            monitor.clone(),
+            log_out,
+            to_inet_tx,
+            lo_port,
+            connections.clone(),
+        )
+        .await?;
         let log_fwd = log_peer.new(slog::o!("traffic" => "inbound"));
         spawn(
+            monitor.clone(),
             log_fwd.clone(),
             "inbound UDP forwarding",
             forward_inbound_traffic(log_fwd, data_inet_rx, connections.clone(), local_pair),
@@ -599,6 +631,7 @@ async fn handle_device(
         let log_get = log_peer.new(slog::o!("dht" => "get"));
 
         spawn(
+            monitor.clone(),
             log_put.clone(),
             "DHT address publishing",
             dht_put(
@@ -610,6 +643,7 @@ async fn handle_device(
             ),
         );
         spawn(
+            monitor.clone(),
             log_get.clone(),
             "DHT address listening",
             dht_get(
@@ -626,11 +660,20 @@ async fn handle_device(
     Ok(())
 }
 
-async fn start_dht(log: &slog::Logger, flags: &DhtFlags) -> anyhow::Result<OpenDht> {
+async fn start_dht(
+    log: &slog::Logger,
+    monitor: TaskMonitor,
+    flags: &DhtFlags,
+) -> anyhow::Result<OpenDht> {
     let dht_log = log.new(slog::o!("task" => "dht"));
-    let dht = OpenDht::new(dht_log, flags.opendht_port, flags.bootstrap_addr.clone())
-        .await
-        .context("Initializing DHT failed")?;
+    let dht = OpenDht::new(
+        monitor,
+        dht_log,
+        flags.opendht_port,
+        flags.bootstrap_addr.clone(),
+    )
+    .await
+    .context("Initializing DHT failed")?;
 
     Ok(dht)
 }
@@ -640,9 +683,14 @@ fn get_generate_file(flags: &GenFlags) -> anyhow::Result<(Option<File>, Option<F
         Some(path) => {
             let mut opts = OpenOptions::new();
             if flags.override_files {
-                opts.create(true);
+                opts.create(true).truncate(true);
             } else {
                 opts.create_new(true);
+            }
+
+            #[cfg(unix)]
+            if !flags.insecure_priv {
+                opts.mode(0o600);
             }
 
             Some(opts
@@ -673,7 +721,7 @@ fn get_generate_file(flags: &GenFlags) -> anyhow::Result<(Option<File>, Option<F
         Some(path) => {
             let mut opts = OpenOptions::new();
             if flags.override_files {
-                opts.create(true);
+                opts.create(true).truncate(true);
             } else {
                 opts.create_new(true);
             }
@@ -719,13 +767,16 @@ async fn async_main() -> anyhow::Result<()> {
                 file.write_all(sk_base64.as_bytes())
                     .context("Failed to write base64 to secret key file")?;
             } else {
-                info!(log, "SecretKey is {:}", sk_base64);
+                std::io::stdout()
+                    .lock()
+                    .write_all(format!("{sk_base64}\n").as_bytes())
+                    .context("Failed to write secret key to stdout")?;
             }
 
             info!(log, "PublicKey is {:}", sk.public_key());
             if let Some(mut file) = pub_file {
                 file.write_all(pk.to_string().as_bytes())
-                    .context("Failed to write base64 to secret key file")?;
+                    .context("Failed to write base64 to public key file")?;
             }
 
             debug!(log, "PublicKey from library is {:}", pk);
@@ -741,12 +792,15 @@ async fn async_main() -> anyhow::Result<()> {
             let log_dev = log.new(slog::o!("dev" => "stun"));
 
             let (public_socket, local_out_port) = get_inet_socket(&log_dev, 0).await?;
-            let (to_inet_tx, from_inet_rx) = split_udp_socket(log_dev.clone(), public_socket);
+            let (monitor, _failure_receiver) = TaskMonitor::new();
+            let (to_inet_tx, from_inet_rx) =
+                split_udp_socket(monitor.clone(), log_dev.clone(), public_socket);
 
             let mut public_address_r = setup_stun(
                 &log_dev,
                 flags,
                 StunSetup {
+                    monitor,
                     to_inet_tx,
                     from_inet_rx,
                     local_out_port,
@@ -764,7 +818,8 @@ async fn async_main() -> anyhow::Result<()> {
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
         Command::Dht { ref flags } => {
-            let dht = start_dht(&log, flags).await?;
+            let (monitor, _failure_receiver) = TaskMonitor::new();
+            let dht = start_dht(&log, monitor, flags).await?;
             let key = &[9, 9, 9];
             let val = &[1, 1, 1, 2];
             dht.put(key, val).await?;
@@ -775,7 +830,22 @@ async fn async_main() -> anyhow::Result<()> {
             }
         }
         Command::Run(ref cmd) => {
-            let dht = start_dht(&log, &cmd.dht_flags).await?;
+            let peer_count: usize = cmd
+                .connections
+                .iter()
+                .map(|connection| connection.peers.len())
+                .sum();
+            if peer_count == 0 {
+                bail!("No peers configured");
+            }
+            if cmd.connection_flags.out_port != 0 && peer_count > 1 {
+                bail!(
+                    "--out-port supports one peer at a time; use the default ephemeral port or run separate processes"
+                );
+            }
+
+            let (monitor, mut failure_receiver) = TaskMonitor::new();
+            let dht = start_dht(&log, monitor.clone(), &cmd.dht_flags).await?;
 
             let mut futures = vec![];
             // Connection is peer public key, currently devices are just numbered.
@@ -783,6 +853,7 @@ async fn async_main() -> anyhow::Result<()> {
                 let dev_name = i.to_string();
                 let log_dev = log.new(slog::o!("dev" => dev_name));
                 futures.push(handle_device(
+                    monitor.clone(),
                     log_dev,
                     dht.clone(),
                     &cmd.stun_flags,
@@ -792,12 +863,17 @@ async fn async_main() -> anyhow::Result<()> {
             }
 
             let results = futures::future::join_all(futures).await;
-            if results.is_empty() {
-                crit!(log, "No connections configured!");
-            } else {
-                results.into_iter().collect::<anyhow::Result<()>>()?;
-                std::future::pending::<()>().await;
-            }
+            results.into_iter().collect::<anyhow::Result<()>>()?;
+            failure_receiver
+                .changed()
+                .await
+                .context("Task supervision stopped unexpectedly")?;
+            bail!(
+                "Background task stopped: {}",
+                failure_receiver
+                    .borrow_and_update()
+                    .unwrap_or("unknown task")
+            );
         }
     };
 
@@ -807,12 +883,18 @@ async fn async_main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dht_key, is_usable_peer_addr, local_ipv6_candidate, parse_dht_message,
-        retained_known_connections,
+        dht_key, get_generate_file, get_inet_socket, is_usable_peer_addr, local_ipv6_candidate,
+        parse_dht_message, retained_known_connections,
     };
+    use crate::config::GenFlags;
     use crate::crypto::PublicKey;
     use std::collections::HashSet;
+    use std::fs;
+    use std::io::Write;
     use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, SystemTime};
 
     #[test]
     fn accepts_the_full_unprivileged_port_range() {
@@ -861,5 +943,59 @@ mod tests {
         let log = slog::Logger::root(slog::Discard, slog::o!());
 
         assert!(parse_dht_message(&log, br#"{"timestamp":{}}"#).is_none());
+    }
+
+    #[test]
+    fn dual_stack_internet_socket_receives_ipv4_datagrams() -> anyhow::Result<()> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let log = slog::Logger::root(slog::Discard, slog::o!());
+                let (socket, _) = get_inet_socket(&log, 0).await?;
+                let destination = SocketAddr::from(([127, 0, 0, 1], socket.local_addr()?.port()));
+                let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+                sender.send_to(b"ipv4", destination).await?;
+
+                let mut buffer = [0; 64];
+                let (length, source) =
+                    tokio::time::timeout(Duration::from_secs(1), socket.recv_from(&mut buffer))
+                        .await??;
+                assert_eq!(&buffer[..length], b"ipv4");
+                assert_eq!(source.port(), sender.local_addr()?.port());
+
+                Ok(())
+            })
+    }
+
+    #[test]
+    fn overriding_a_private_key_file_truncates_and_secures_it() -> anyhow::Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("p2p-tunnler-key-{unique}"));
+        let path_text = path.to_string_lossy().to_string();
+        let pub_path = format!("{path_text}.pub");
+        fs::write(&path, b"this previous key material is deliberately longer")?;
+
+        let flags = GenFlags {
+            path: Some(path_text),
+            pub_path: None,
+            insecure_priv: false,
+            override_files: true,
+        };
+        let (private_key, public_key) = get_generate_file(&flags)?;
+        let mut private_key = private_key.expect("private key file should be open");
+        private_key.write_all(b"replacement")?;
+        drop(private_key);
+        drop(public_key);
+
+        assert_eq!(fs::read(&path)?, b"replacement");
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+
+        fs::remove_file(&path)?;
+        fs::remove_file(pub_path)?;
+        Ok(())
     }
 }

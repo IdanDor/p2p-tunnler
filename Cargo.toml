@@ -21,6 +21,7 @@ futures = "0.3.8"
 crypto_box = "0.9.1"
 byteorder = "1.5"
 rand = "0.10"
+socket2 = "0.6"
 
 
 async-broadcast = "0.7"

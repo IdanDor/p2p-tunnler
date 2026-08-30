@@ -39,9 +39,14 @@ fixtures.
 ## Runtime and tasks
 
 The binary uses a Tokio current-thread runtime. Long-lived UDP, STUN, DHT, and
-forwarding operations are independent tasks. A background task logs a
-structured error instead of panicking; its failure is still visible to the
-operator through the task name and error fields.
+forwarding operations are independent tasks. A failed background task logs a
+structured error and terminates `run` with a nonzero result instead of leaving
+an apparently healthy process with a broken data plane.
+
+UDP work queues are deliberately bounded. During sustained overload, excess
+datagrams are dropped rather than retained in process memory; this matches
+UDP's lossy transport semantics and keeps a congested peer from exhausting
+the service.
 
 Router NAT mapping is an opt-in worker because the upstream mapping libraries
 use blocking discovery APIs. It only talks to the local gateway and maintains

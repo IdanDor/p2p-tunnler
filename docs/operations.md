@@ -42,13 +42,18 @@ DHT payloads.
 | Peer can use IPv4 and IPv6 | `run tunnels.yaml` | Gather normal candidates. |
 | Remote desktop is IPv4-only | `run tunnels.yaml --filter-ipv6` | Publish only local IPv4 and reject remote IPv6. |
 | Router supports PCP/NAT-PMP/UPnP | `run tunnels.yaml --nat-map` | Ask the local router for a renewable direct UDP mapping. |
-| Manual router forwarding | `run tunnels.yaml --out-port 12345` | Bind the predictable local Internet port for the rule. |
+| Manual router forwarding | `run tunnels.yaml --out-port 12345` | Bind the predictable local Internet port for one configured peer. |
 | Temporary endpoint churn | `run tunnels.yaml --no-clear` | Retain old remote candidates; may preserve stale endpoints. |
 
 `--nat-map` does not open a host firewall and does not use a cloud service. It
 only requests a mapping on the local gateway. It may fail on routers that do
 not support one of the protocols, on double NAT, or when policy disables
 mapping; the service continues with STUN candidates and logs the result.
+
+`--out-port` is a single Internet UDP port. A configuration with more than one
+peer must use the default ephemeral ports or run one process per peer when
+manual forwarding is required; startup rejects an ambiguous multi-peer fixed
+port request before opening sockets.
 
 ## Diagnosing no packets
 

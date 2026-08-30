@@ -2,6 +2,8 @@ use futures::{Stream, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::utils::{TaskMonitor, spawn};
+
 #[derive(Clone)]
 pub struct OpenDht {
     dht: Arc<opendht::OpenDht>,
@@ -9,6 +11,7 @@ pub struct OpenDht {
 
 impl OpenDht {
     pub async fn new(
+        monitor: TaskMonitor,
         log: slog::Logger,
         listen_port: u16,
         bootstrap_servers: impl tokio::net::ToSocketAddrs,
@@ -24,11 +27,11 @@ impl OpenDht {
         slog::info!(log, "OpenDHT bootstrapping done");
 
         let dht2 = dht.clone();
-        tokio::spawn(async move {
+        spawn(monitor, log, "OpenDHT tick loop", async move {
             while let Some(next) = dht2.tick() {
                 tokio::time::sleep(next).await;
             }
-            slog::crit!(log, "OpenDHT loop ended!");
+            anyhow::bail!("OpenDHT tick loop ended")
         });
 
         Ok(OpenDht { dht })
