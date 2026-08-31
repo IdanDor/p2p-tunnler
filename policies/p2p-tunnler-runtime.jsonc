@@ -28,10 +28,9 @@
     ]
   },
 
-  // Keep the schema-v3 defaults: deny abstract Unix-socket communication and
+  // The secure default restricts abstract Unix-socket communication and
   // cross-scope signals. UDP is intentionally required by this application;
   // current Landlock support cannot restrict UDP destination addresses.
-  "scope_escape": ["abstract_unix_socket", "signal"],
 
   // Default allow is paired with explicit, audited denies and strict
   // filesystem confinement. A default-deny syscall list must be generated
