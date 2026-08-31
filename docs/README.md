@@ -4,6 +4,8 @@
   targets.
 - [Compatibility contract](compatibility.md): network and data-format behavior
   that must remain compatible with an unmodified 0.1.0 peer.
+- [Threat model](threat-model.md): trust boundaries, security controls, and
+  known residual risks for the direct UDP and DHT design.
 - [Direct-only NAT traversal](direct-only-nat-traversal.md): design and
   constraints for direct connectivity without a traffic relay.
 - [Control-plane path probes](control-plane-probes.md): idle-path verification

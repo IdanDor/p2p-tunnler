@@ -7,6 +7,7 @@ use anyhow::Result;
 use rand::RngExt;
 use tokio::sync::Mutex;
 
+use crate::transport::Connections;
 use crate::utils::{UdpReceiver, UdpSender, try_send};
 
 pub const MAGIC: [u8; 4] = *b"P2PC";
@@ -38,7 +39,7 @@ struct Path {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PacketAction {
-    Echo,
+    EchoAndAdmit,
     Acknowledged,
     Drop,
 }
@@ -118,7 +119,7 @@ impl ProbeController {
             {
                 return PacketAction::Drop;
             }
-            return PacketAction::Echo;
+            return PacketAction::EchoAndAdmit;
         }
         if state.remote_token != Some(token) {
             return PacketAction::Drop;
@@ -208,10 +209,14 @@ pub async fn handle_packets(
     controller: ProbeController,
     mut from_internet: UdpReceiver,
     to_internet: UdpSender,
+    connections: Connections,
 ) -> Result<()> {
     while let Some((packet, source)) = from_internet.recv().await {
         match controller.packet_action(&packet, source).await {
-            PacketAction::Echo => {
+            PacketAction::EchoAndAdmit => {
+                if connections.write().await.add_peer_reflexive(source) {
+                    slog::info!(log, "Peer-reflexive address admitted by control probe"; "source" => source);
+                }
                 let _ = try_send(&to_internet, (packet.to_vec(), source))?;
             }
             PacketAction::Acknowledged => {
@@ -242,9 +247,15 @@ fn jitter(interval: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        FRAME_LEN, PacketAction, ProbeController, classify, decode_token, frame, parse_frame,
+        FRAME_LEN, PacketAction, ProbeController, classify, decode_token, frame, handle_packets,
+        parse_frame,
     };
     use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{RwLock, mpsc};
+
+    use crate::transport::Connections;
 
     #[test]
     fn frames_are_exact_and_malformed_control_frames_stay_control() {
@@ -266,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn request_is_echoed_but_unknown_packets_are_dropped() -> anyhow::Result<()> {
+    fn valid_local_token_is_admitted_and_unknown_packets_are_dropped() -> anyhow::Result<()> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
@@ -276,12 +287,48 @@ mod tests {
                 let source: SocketAddr = "192.0.2.10:12345".parse().unwrap();
                 assert_eq!(
                     controller.packet_action(&frame(token), source).await,
-                    PacketAction::Echo
+                    PacketAction::EchoAndAdmit
                 );
                 assert_eq!(
                     controller.packet_action(&frame([9; 16]), source).await,
                     PacketAction::Drop
                 );
+                Ok(())
+            })
+    }
+
+    #[test]
+    fn valid_local_token_adds_a_peer_reflexive_candidate() -> anyhow::Result<()> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let controller = ProbeController::new();
+                let token = decode_token(&controller.local_token_base64().await).unwrap();
+                let source: SocketAddr = "192.0.2.10:12345".parse().unwrap();
+                let (from_sender, from_receiver) = mpsc::channel(1);
+                let (to_sender, mut to_receiver) = mpsc::channel(1);
+                let connections: Connections = Arc::new(RwLock::new(Default::default()));
+                let task = tokio::spawn(handle_packets(
+                    slog::Logger::root(slog::Discard, slog::o!()),
+                    controller,
+                    from_receiver,
+                    to_sender,
+                    connections.clone(),
+                ));
+
+                from_sender
+                    .send((bytes::Bytes::copy_from_slice(&frame(token)), source))
+                    .await?;
+                let (_, echo_destination) =
+                    tokio::time::timeout(Duration::from_secs(1), to_receiver.recv())
+                        .await?
+                        .expect("probe echo should be queued");
+                assert_eq!(echo_destination, source);
+                assert!(connections.read().await.contains(&source));
+
+                drop(from_sender);
+                assert!(task.await?.is_err());
                 Ok(())
             })
     }

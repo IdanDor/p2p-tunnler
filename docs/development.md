@@ -38,6 +38,24 @@ checkout. Never commit `.cargo/`. Also preserve the pinned OpenDHT
 `Cargo.lock`; a local path patch can cause Cargo to omit it during local
 builds.
 
+To keep that intentional local lockfile drift out of `git status`, mark the
+file as skip-worktree in the local checkout:
+
+```sh
+git update-index --skip-worktree Cargo.lock
+```
+
+Before making or reviewing a real dependency update, re-enable tracking and
+restore the repository version first:
+
+```sh
+git update-index --no-skip-worktree Cargo.lock
+git restore Cargo.lock
+```
+
+`skip-worktree` hides genuine lockfile changes too, so do not leave it enabled
+while changing dependencies.
+
 Run `cargo audit` when updating dependencies. The dependency graph is expected
 to be free of RustSec advisories; update both `Cargo.lock` and `Cargo.nix` for
 any remediation.

@@ -89,7 +89,11 @@ socket from becoming a useful reflector. IPv4 and IPv6 source candidates are
 kept as exact `SocketAddr` paths, so an acknowledgement cannot validate a
 different address family or source.
 
-Only DHT-authenticated candidates become WireGuard data peers. Unsolicited UDP
-sources are dropped from the data path. The implementation does not add router
-rules, firewall changes, root privileges, a relay, or a public data-path
-server.
+A source which presents the local run token becomes a bounded
+peer-reflexive candidate and may exchange WireGuard data. This lets a peer
+recover when its STUN-advertised address differs from the source address that
+actually reaches us. DHT candidates and peer-reflexive candidates are retained
+separately, so a DHT refresh does not immediately remove the recovered path.
+Other unsolicited UDP sources are dropped from the data path. The
+implementation does not add router rules, firewall changes, root privileges, a
+relay, or a public data-path server.

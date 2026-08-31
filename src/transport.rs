@@ -9,7 +9,48 @@ use tokio::sync::{RwLock, mpsc};
 
 use crate::utils::{TaskMonitor, UDP_QUEUE_CAPACITY, UdpReceiver, UdpSender, spawn, try_send};
 
-pub type Connections = Arc<RwLock<HashSet<SocketAddr>>>;
+pub const MAX_PEER_REFLEXIVE_CANDIDATES: usize = 64;
+
+#[derive(Default)]
+pub struct CandidateSet {
+    advertised: HashSet<SocketAddr>,
+    peer_reflexive: HashSet<SocketAddr>,
+}
+
+impl CandidateSet {
+    pub fn contains(&self, address: &SocketAddr) -> bool {
+        self.advertised.contains(address) || self.peer_reflexive.contains(address)
+    }
+
+    pub fn addresses(&self) -> impl Iterator<Item = SocketAddr> + '_ {
+        self.advertised.iter().copied().chain(
+            self.peer_reflexive
+                .iter()
+                .filter(|address| !self.advertised.contains(address))
+                .copied(),
+        )
+    }
+
+    pub fn advertised(&self) -> &HashSet<SocketAddr> {
+        &self.advertised
+    }
+
+    pub fn replace_advertised(&mut self, addresses: HashSet<SocketAddr>) {
+        self.advertised = addresses;
+    }
+
+    /// Adds a source which proved knowledge of this connection's current
+    /// probe token. These candidates are kept separately so a DHT refresh
+    /// does not immediately remove a working peer-reflexive endpoint.
+    pub fn add_peer_reflexive(&mut self, address: SocketAddr) -> bool {
+        if self.contains(&address) || self.peer_reflexive.len() == MAX_PEER_REFLEXIVE_CANDIDATES {
+            return false;
+        }
+        self.peer_reflexive.insert(address)
+    }
+}
+
+pub type Connections = Arc<RwLock<CandidateSet>>;
 pub type LocalPeer = Arc<RwLock<(UdpSender, Option<SocketAddr>)>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,8 +90,8 @@ pub async fn bind_loopback_and_forward(
                 }
 
                 let peers = remote_peers.read().await;
-                for remote_peer in peers.iter() {
-                    let _ = try_send(&to_internet, (packet.to_vec(), *remote_peer))?;
+                for remote_peer in peers.addresses() {
+                    let _ = try_send(&to_internet, (packet.to_vec(), remote_peer))?;
                     slog::debug!(log, "Outbound packet forwarded"; "src" => wireguard_addr, "via_lo" => local_addr, "dst" => remote_peer, "bytes" => packet.len());
                 }
             }
@@ -154,7 +195,11 @@ pub async fn open_internet_socket(
 
 #[cfg(test)]
 mod tests {
-    use super::{InternetPacketKind, normalize_ipv4_mapped_source, open_internet_socket};
+    use super::{
+        CandidateSet, InternetPacketKind, MAX_PEER_REFLEXIVE_CANDIDATES,
+        normalize_ipv4_mapped_source, open_internet_socket,
+    };
+    use std::collections::HashSet;
     use std::net::SocketAddr;
     use std::time::Duration;
     use tokio::net::UdpSocket;
@@ -210,5 +255,30 @@ mod tests {
             normalize_ipv4_mapped_source(mapped),
             "192.0.2.10:12345".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn peer_reflexive_candidates_are_bounded() {
+        let mut candidates = CandidateSet::default();
+        for port in 10_000..(10_000 + MAX_PEER_REFLEXIVE_CANDIDATES as u16) {
+            assert!(candidates.add_peer_reflexive(SocketAddr::from(([192, 0, 2, 1], port))));
+        }
+        assert!(!candidates.add_peer_reflexive(SocketAddr::from(([192, 0, 2, 2], 20_000))));
+        assert_eq!(
+            candidates.addresses().count(),
+            MAX_PEER_REFLEXIVE_CANDIDATES
+        );
+    }
+
+    #[test]
+    fn peer_reflexive_candidates_survive_advertised_candidate_refreshes() {
+        let peer_reflexive = SocketAddr::from(([192, 0, 2, 1], 10_000));
+        let advertised = SocketAddr::from(([192, 0, 2, 2], 10_001));
+        let mut candidates = CandidateSet::default();
+        assert!(candidates.add_peer_reflexive(peer_reflexive));
+        candidates.replace_advertised(HashSet::from([advertised]));
+
+        assert!(candidates.contains(&peer_reflexive));
+        assert!(candidates.contains(&advertised));
     }
 }

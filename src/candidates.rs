@@ -131,23 +131,26 @@ pub async fn listen_for_peer_candidates(
 
         let known_peers = connections.read().await;
         if flags.no_clear {
-            for peer in retained_known_connections(&known_peers, flags.filter_ipv6) {
+            for peer in retained_known_connections(known_peers.advertised(), flags.filter_ipv6) {
                 if updated_peers.len() == MAX_REMOTE_CANDIDATES {
                     break;
                 }
                 updated_peers.insert(peer);
             }
         }
-        for peer in known_peers.difference(&updated_peers) {
+        for peer in known_peers.advertised().difference(&updated_peers) {
             slog::info!(log, "Known peer address will no longer be used, not found in DHT"; "addr" => peer);
         }
-        for peer in updated_peers.difference(&known_peers) {
+        for peer in updated_peers.difference(known_peers.advertised()) {
             slog::info!(log, "New peer address found"; "addr" => peer);
         }
-        let changed = *known_peers != updated_peers;
+        let changed = known_peers.advertised() != &updated_peers;
         drop(known_peers);
         if changed {
-            *connections.write().await = updated_peers.clone();
+            connections
+                .write()
+                .await
+                .replace_advertised(updated_peers.clone());
         }
 
         probes

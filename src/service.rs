@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow, bail};
@@ -162,7 +161,7 @@ async fn setup_connection(
         )
         .await?;
 
-        let connections: Connections = Arc::new(tokio::sync::RwLock::new(HashSet::new()));
+        let connections: Connections = Arc::new(tokio::sync::RwLock::new(Default::default()));
         let local_peer = bind_loopback_and_forward(
             monitor.clone(),
             peer_log.new(slog::o!("traffic" => "outbound")),
@@ -181,6 +180,7 @@ async fn setup_connection(
                 probes.clone(),
                 from_probes,
                 to_internet.clone(),
+                connections.clone(),
             ),
         );
         spawn(
