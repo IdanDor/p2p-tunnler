@@ -14,6 +14,8 @@
   diagnosis.
 - [Development and AI-assisted work](development.md): validation, dependency,
   and review requirements.
+- [Deferred audit items](deferred-audit-items.md): compatibility-sensitive
+  hardening work intentionally left for separate changes.
 
 Keep long-lived design decisions, compatibility constraints, and operational
 guidance here. Do not place keys, production endpoints, or packet captures
