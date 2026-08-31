@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail};
 
 use slog::debug;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::LazyLock;
 use std::time::Duration;
 use std::time::Instant;
@@ -84,7 +84,19 @@ async fn send_request(
 }
 
 fn is_expected_stun_source(source: SocketAddr, stun_server: SocketAddr) -> bool {
-    source == stun_server
+    normalize_ipv4_mapped_source(source) == stun_server
+}
+
+/// A dual-stack socket can report an IPv4 peer as an IPv4-mapped IPv6 address.
+/// STUN is configured with an IPv4 server address, so compare that form as IPv4.
+fn normalize_ipv4_mapped_source(source: SocketAddr) -> SocketAddr {
+    let SocketAddr::V6(source_v6) = source else {
+        return source;
+    };
+    let Some(ipv4) = source_v6.ip().to_ipv4_mapped() else {
+        return source;
+    };
+    SocketAddr::new(IpAddr::V4(ipv4), source_v6.port())
 }
 
 #[cfg(test)]
@@ -102,6 +114,23 @@ mod tests {
         ));
         assert!(!is_expected_stun_source(
             "192.0.2.1:3479".parse().unwrap(),
+            server
+        ));
+    }
+
+    #[test]
+    fn accepts_ipv4_mapped_source_from_dual_stack_socket() {
+        let server: SocketAddr = "192.0.2.1:3478".parse().unwrap();
+        assert!(is_expected_stun_source(
+            "[::ffff:192.0.2.1]:3478".parse().unwrap(),
+            server
+        ));
+        assert!(!is_expected_stun_source(
+            "[::ffff:192.0.2.2]:3478".parse().unwrap(),
+            server
+        ));
+        assert!(!is_expected_stun_source(
+            "[::ffff:192.0.2.1]:3479".parse().unwrap(),
             server
         ));
     }
