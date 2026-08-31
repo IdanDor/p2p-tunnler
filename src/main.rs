@@ -6,6 +6,7 @@ mod dht;
 mod keygen;
 mod message;
 mod nat;
+mod probe;
 mod service;
 mod stun;
 mod transport;

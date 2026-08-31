@@ -11,14 +11,16 @@ use tokio::net::UdpSocket;
 use crate::config::{ConnectionFlags, StunFlags};
 use crate::crypto::{CryptoBox, PublicKey, SecretKey};
 use crate::dht::OpenDht;
-use crate::message::Message;
+use crate::message::{Control, Message};
 use crate::nat;
+use crate::probe::{ProbeController, decode_token};
 use crate::stun;
 use crate::transport::Connections;
 use crate::utils::{TaskMonitor, UdpReceiver, UdpSender, spawn};
 
 const MAX_DHT_MESSAGE_AGE: Duration = Duration::from_secs(10 * 60);
 const MAX_DHT_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
+const MAX_REMOTE_CANDIDATES: usize = 64;
 
 pub fn dht_key(publisher: &PublicKey, subscriber: &PublicKey) -> Vec<u8> {
     let mut key = Vec::with_capacity(64);
@@ -71,6 +73,7 @@ pub async fn listen_for_peer_candidates(
     remote_key: PublicKey,
     connections: Connections,
     flags: ConnectionFlags,
+    probes: ProbeController,
 ) -> anyhow::Result<()> {
     let local_key = private_key.public_key();
     let crypto = CryptoBox::new(&remote_key, &private_key);
@@ -110,16 +113,30 @@ pub async fn listen_for_peer_candidates(
         }
         last_timestamp = Some(message.timestamp);
 
+        let remote_token = message
+            .control
+            .as_ref()
+            .and_then(|control| decode_token(&control.probe_token));
+        if message.control.is_some() && remote_token.is_none() {
+            slog::debug!(log, "Ignoring invalid control extension in DHT message");
+        }
+
         let mut updated_peers: HashSet<_> = message
             .ip_addr_list
             .into_iter()
             .filter(|addr| !flags.filter_ipv6 || addr.ip().is_ipv4())
             .filter(is_usable_peer_addr)
+            .take(MAX_REMOTE_CANDIDATES)
             .collect();
 
         let known_peers = connections.read().await;
         if flags.no_clear {
-            updated_peers.extend(retained_known_connections(&known_peers, flags.filter_ipv6));
+            for peer in retained_known_connections(&known_peers, flags.filter_ipv6) {
+                if updated_peers.len() == MAX_REMOTE_CANDIDATES {
+                    break;
+                }
+                updated_peers.insert(peer);
+            }
         }
         for peer in known_peers.difference(&updated_peers) {
             slog::info!(log, "Known peer address will no longer be used, not found in DHT"; "addr" => peer);
@@ -130,8 +147,12 @@ pub async fn listen_for_peer_candidates(
         let changed = *known_peers != updated_peers;
         drop(known_peers);
         if changed {
-            *connections.write().await = updated_peers;
+            *connections.write().await = updated_peers.clone();
         }
+
+        probes
+            .update_remote(remote_token, updated_peers.into_iter().collect())
+            .await;
 
         slog::debug!(log, "Waiting for remote peer to publish a new IP in DHT..."; "dht_key" => general_purpose::STANDARD.encode(&key));
     }
@@ -145,31 +166,40 @@ pub async fn publish_candidates(
     private_key: SecretKey,
     remote_key: PublicKey,
     mut candidates: Receiver<Vec<SocketAddr>>,
+    probes: ProbeController,
 ) -> anyhow::Result<()> {
     let local_key = private_key.public_key();
     let crypto = CryptoBox::new(&remote_key, &private_key);
     let key = dht_key(&local_key, &remote_key);
     slog::info!(log, "Will publish own public address on DHT"; "dht_key" => general_purpose::STANDARD.encode(&key));
 
+    let control = Control {
+        probe_token: probes.local_token_base64().await,
+    };
+    let mut addresses = Vec::new();
     loop {
-        let addresses = match candidates.recv().await {
-            Ok(addresses) => addresses,
-            Err(RecvError::Closed) => bail!("STUN candidate source stopped"),
-            Err(RecvError::Overflowed(_)) => {
-                slog::debug!(log, "Missed a new public address, overflowed, continuing");
-                continue;
-            }
-        };
         let address_log = format!("{addresses:?}");
         let message = Message {
             timestamp: SystemTime::now(),
-            ip_addr_list: addresses,
+            ip_addr_list: addresses.clone(),
+            control: Some(control.clone()),
         };
         let plaintext = serde_json::to_vec(&message)?;
         let value = crypto.encrypt(&plaintext)?;
 
         dht.put(&key, &value).await?;
         slog::info!(log, "Published own public address on DHT"; "dht_key" => general_purpose::STANDARD.encode(&key), "addrs" => address_log);
+
+        match tokio::time::timeout(Duration::from_secs(60), candidates.recv()).await {
+            Err(_) => {}
+            Ok(received) => match received {
+                Ok(new_addresses) => addresses = new_addresses,
+                Err(RecvError::Closed) => bail!("STUN candidate source stopped"),
+                Err(RecvError::Overflowed(_)) => {
+                    slog::debug!(log, "Missed a new public address, overflowed, continuing");
+                }
+            },
+        }
     }
 }
 

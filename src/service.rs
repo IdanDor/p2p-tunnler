@@ -10,10 +10,11 @@ use crate::candidates::{
 use crate::config::{ConnectionFlags, P2PConnection, Peer, RunCommand, StunFlags};
 use crate::crypto::{PublicKey, SecretKey};
 use crate::dht::OpenDht;
+use crate::probe::{self, ProbeController};
 use crate::stun::codec::MAGIC_COOKIE;
 use crate::transport::{
-    Connections, bind_loopback_and_forward, forward_inbound_traffic, open_internet_socket,
-    split_internet_receiver,
+    Connections, InternetPacketKind, bind_loopback_and_forward, forward_inbound_traffic,
+    open_internet_socket, split_internet_receiver,
 };
 use crate::utils::{TaskMonitor, spawn};
 
@@ -123,10 +124,23 @@ async fn setup_connection(
             open_internet_socket(&peer_log, connection_flags.out_port).await?;
         let (to_internet, from_internet) =
             crate::utils::split_udp_socket(monitor.clone(), peer_log.clone(), internet_socket);
-        let (from_stun, from_peers) =
+        let (from_probes, from_stun, from_peers) =
             split_internet_receiver(monitor.clone(), peer_log.clone(), from_internet, |packet| {
-                packet.len() > 20 && packet[4..12] == ((MAGIC_COOKIE as u64) << 32).to_be_bytes()
+                if probe::classify(packet) {
+                    if packet.len() == probe::FRAME_LEN {
+                        InternetPacketKind::Probe
+                    } else {
+                        InternetPacketKind::Drop
+                    }
+                } else if packet.len() > 20
+                    && packet[4..12] == ((MAGIC_COOKIE as u64) << 32).to_be_bytes()
+                {
+                    InternetPacketKind::Stun
+                } else {
+                    InternetPacketKind::Data
+                }
             });
+        let probes = ProbeController::new();
 
         let nat_mapping = if connection_flags.nat_map {
             request_nat_mapping(&peer_log, local_port).await
@@ -152,11 +166,29 @@ async fn setup_connection(
         let local_peer = bind_loopback_and_forward(
             monitor.clone(),
             peer_log.new(slog::o!("traffic" => "outbound")),
-            to_internet,
+            to_internet.clone(),
             peer.local_port,
             connections.clone(),
         )
         .await?;
+
+        spawn(
+            monitor.clone(),
+            peer_log.new(slog::o!("traffic" => "control")),
+            "control UDP handler",
+            probe::handle_packets(
+                peer_log.new(slog::o!("traffic" => "control")),
+                probes.clone(),
+                from_probes,
+                to_internet.clone(),
+            ),
+        );
+        spawn(
+            monitor.clone(),
+            peer_log.new(slog::o!("traffic" => "control")),
+            "control probe scheduler",
+            probe::schedule_probes(probes.clone(), to_internet.clone()),
+        );
 
         spawn(
             monitor.clone(),
@@ -179,6 +211,7 @@ async fn setup_connection(
                 secret_key.clone(),
                 remote_key.clone(),
                 local_candidates,
+                probes.clone(),
             ),
         );
         spawn(
@@ -192,6 +225,7 @@ async fn setup_connection(
                 remote_key,
                 connections,
                 connection_flags.clone(),
+                probes,
             ),
         );
     }

@@ -12,6 +12,14 @@ use crate::utils::{TaskMonitor, UDP_QUEUE_CAPACITY, UdpReceiver, UdpSender, spaw
 pub type Connections = Arc<RwLock<HashSet<SocketAddr>>>;
 pub type LocalPeer = Arc<RwLock<(UdpSender, Option<SocketAddr>)>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InternetPacketKind {
+    Probe,
+    Stun,
+    Data,
+    Drop,
+}
+
 pub async fn bind_loopback_and_forward(
     monitor: TaskMonitor,
     parent_log: slog::Logger,
@@ -57,24 +65,42 @@ pub fn split_internet_receiver(
     monitor: TaskMonitor,
     log: slog::Logger,
     mut receiver: UdpReceiver,
-    is_control_packet: impl Fn(&[u8]) -> bool + Send + 'static,
-) -> (UdpReceiver, UdpReceiver) {
-    let (control_sender, control_receiver) = mpsc::channel(UDP_QUEUE_CAPACITY);
+    classify: impl Fn(&[u8]) -> InternetPacketKind + Send + 'static,
+) -> (UdpReceiver, UdpReceiver, UdpReceiver) {
+    let (probe_sender, probe_receiver) = mpsc::channel(UDP_QUEUE_CAPACITY);
+    let (stun_sender, stun_receiver) = mpsc::channel(UDP_QUEUE_CAPACITY);
     let (data_sender, data_receiver) = mpsc::channel(UDP_QUEUE_CAPACITY);
 
     spawn(monitor, log, "internet UDP receive routing", async move {
         while let Some((packet, source)) = receiver.recv().await {
-            let sender = if is_control_packet(&packet) {
-                &control_sender
-            } else {
-                &data_sender
+            let source = normalize_ipv4_mapped_source(source);
+            let sender = match classify(&packet) {
+                InternetPacketKind::Probe => Some(&probe_sender),
+                InternetPacketKind::Stun => Some(&stun_sender),
+                InternetPacketKind::Data => Some(&data_sender),
+                InternetPacketKind::Drop => None,
             };
-            let _ = try_send(sender, (packet, source))?;
+            if let Some(sender) = sender {
+                let _ = try_send(sender, (packet, source))?;
+            }
         }
         Ok(())
     });
 
-    (control_receiver, data_receiver)
+    (probe_receiver, stun_receiver, data_receiver)
+}
+
+/// Dual-stack sockets may report IPv4 senders as IPv4-mapped IPv6 addresses.
+/// DHT candidates use ordinary IPv4 `SocketAddr` values, so normalize once at
+/// the common receive boundary before matching data or control paths.
+fn normalize_ipv4_mapped_source(source: SocketAddr) -> SocketAddr {
+    let SocketAddr::V6(source_v6) = source else {
+        return source;
+    };
+    let Some(ipv4) = source_v6.ip().to_ipv4_mapped() else {
+        return source;
+    };
+    SocketAddr::new(IpAddr::V4(ipv4), source_v6.port())
 }
 
 pub async fn forward_inbound_traffic(
@@ -86,11 +112,9 @@ pub async fn forward_inbound_traffic(
     while let Some((packet, remote_peer)) = from_internet.recv().await {
         slog::debug!(log, "Received inbound packet"; "src" => remote_peer, "bytes" => packet.len());
 
-        let known_peers = connections.read().await;
-        if !known_peers.contains(&remote_peer) {
-            drop(known_peers);
-            slog::info!(log, "New inbound peer, adding to connections"; "src" => remote_peer);
-            connections.write().await.insert(remote_peer);
+        if !connections.read().await.contains(&remote_peer) {
+            slog::debug!(log, "Ignoring inbound packet from an unconfigured source"; "src" => remote_peer, "bytes" => packet.len());
+            continue;
         }
 
         let local_peer = local_peer.read().await;
@@ -130,7 +154,7 @@ pub async fn open_internet_socket(
 
 #[cfg(test)]
 mod tests {
-    use super::open_internet_socket;
+    use super::{InternetPacketKind, normalize_ipv4_mapped_source, open_internet_socket};
     use std::net::SocketAddr;
     use std::time::Duration;
     use tokio::net::UdpSocket;
@@ -155,5 +179,36 @@ mod tests {
                 assert_eq!(source.port(), sender.local_addr()?.port());
                 Ok(())
             })
+    }
+
+    #[test]
+    fn receive_router_gives_control_frames_priority_over_data() {
+        let classify = |packet: &[u8]| {
+            if packet.starts_with(b"P2PC") {
+                if packet.len() == 20 {
+                    InternetPacketKind::Probe
+                } else {
+                    InternetPacketKind::Drop
+                }
+            } else if packet.len() > 20 && packet[4..12] == 0x2112_A442_0000_0000u64.to_be_bytes() {
+                InternetPacketKind::Stun
+            } else {
+                InternetPacketKind::Data
+            }
+        };
+        let mut probe = [0; 20];
+        probe[..4].copy_from_slice(b"P2PC");
+        assert_eq!(classify(&probe), InternetPacketKind::Probe);
+        assert_eq!(classify(b"P2PC-short"), InternetPacketKind::Drop);
+        assert_eq!(classify(b"wireguard"), InternetPacketKind::Data);
+    }
+
+    #[test]
+    fn normalizes_ipv4_mapped_sources_before_candidate_matching() {
+        let mapped: SocketAddr = "[::ffff:192.0.2.10]:12345".parse().unwrap();
+        assert_eq!(
+            normalize_ipv4_mapped_source(mapped),
+            "192.0.2.10:12345".parse().unwrap()
+        );
     }
 }

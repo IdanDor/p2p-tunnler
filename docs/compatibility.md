@@ -34,7 +34,11 @@ must not change without a compatible migration.
   ```
 
   The JSON field names, timestamp serialization, and socket-address
-  serialization are part of the compatibility surface.
+  serialization are part of the compatibility surface. Updated peers may add
+  optional fields that a 0.1.0 Serde decoder ignores; the control-plane
+  `control` extension is defined in [control-plane-probes.md](control-plane-probes.md).
+  When no extension is emitted, serialization remains the exact two-field
+  legacy form.
 - The encrypted DHT value begins with the 24-byte nonce, followed by the
   legacy precomputed `crypto_box` ciphertext. A replacement crypto crate must
   produce and consume this exact byte representation for legacy peers.

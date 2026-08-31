@@ -21,6 +21,12 @@ loopback UDP listener <-> forwarding tasks <-> Internet UDP socket
                                      direct remote UDP endpoint
 ```
 
+The Internet receive router keeps the control protocols separate from the
+WireGuard forwarding path: fixed-size `P2PC` frames are handled as path probes,
+STUN frames go to candidate gathering, and all remaining datagrams use the
+WireGuard path. See [control-plane-probes.md](control-plane-probes.md) for the
+probe protocol.
+
 ## Identity and compatibility surface
 
 Each YAML connection holds one 32-byte Curve25519 secret key and one or more

@@ -1,26 +1,14 @@
 # Control-plane path probes
 
-## Status
+Control-plane probes show that an updated remote peer can exchange direct UDP
+without waiting for WireGuard traffic. They never carry, relay, inspect, or
+gate WireGuard datagrams. The data plane remains direct UDP between the two
+peer endpoints.
 
-Planned design. This document defines the small direct UDP probe protocol to
-implement in a later focused change. It does not change the current wire
-behavior by itself.
+## DHT record extension
 
-## Goal
-
-An updated peer must be able to learn that a direct UDP path to its configured
-remote peer works even while WireGuard sends no data. The probe protocol is
-control-plane traffic only: it never relays WireGuard traffic and never adds a
-server to the data path.
-
-The control-plane scheduler is deliberately independent of the data plane. It
-does not inspect outbound or inbound WireGuard packets, and those packets do
-not delay, suppress, or mark control probes successful.
-
-## DHT extension and legacy compatibility
-
-Continue to publish the legacy encrypted JSON record with its existing
-`timestamp` and `ip_addr_list` fields. An updated peer adds one optional field:
+The encrypted DHT plaintext retains the legacy `timestamp` and `ip_addr_list`
+fields and may include this optional extension:
 
 ```json
 {
@@ -32,117 +20,76 @@ Continue to publish the legacy encrypted JSON record with its existing
 }
 ```
 
-`probe_token` is exactly 16 random bytes. Generate it once when a connection
-starts and retain it unchanged until that connection stops. A subsequent run
-generates a different token, so its receiver rejects packets from a previous
-run. Delayed or replayed packets containing the current run's token are
-accepted by design.
+`probe_token` encodes exactly 16 random bytes. It is generated once for each
+local/remote connection, remains unchanged while that connection runs, and is
+replaced on restart. Older peers ignore the unknown `control` field and retain
+their legacy candidate behavior. An absent or invalid extension means the
+remote is control-unverified; it does not prevent ordinary candidate
+forwarding.
 
-The unmodified 0.1.0 `Message` derives ordinary Serde `Deserialize` and does
-not use `deny_unknown_fields`; it ignores `control` while continuing to use
-the two legacy fields. The implementation must add a regression fixture that
-deserializes an extended record with the unmodified 0.1.0 representation.
-The existing legacy serialization fixture must continue to assert the exact
-two-field form when no control extension is emitted.
+The DHT publisher sends a record immediately, publishes again after candidate
+updates, and refreshes it every 60 seconds. Every publication has a new legacy
+timestamp but the same run token.
 
-An updated peer that receives no `control` field treats the remote as a legacy
-or not-yet-upgraded peer. It retains current candidate forwarding behavior and
-reports the path as control-unverified; lack of the extension is not a
-connection failure.
+## UDP protocol and routing
 
-Publish the record immediately at startup and after candidate changes, then
-refresh it every 60 seconds with the same token and a new legacy timestamp.
-This makes a running peer discoverable without rotating its run identity.
-
-## UDP frame
-
-Every control UDP datagram is exactly 20 bytes:
+A probe frame is exactly 20 bytes:
 
 ```text
 0..4   ASCII magic: "P2PC"
 4..20  16-byte probe token
 ```
 
-`P2PC` cannot be a valid WireGuard message prefix: WireGuard message types
-begin with a four-byte little-endian value from 1 through 4. The Internet UDP
-receive router classifies packets in this order:
+`P2PC` cannot be a WireGuard prefix because WireGuard message types start with
+the four-byte little-endian values 1 through 4. The Internet socket classifies
+incoming datagrams in this order:
 
-1. A 20-byte packet beginning with `P2PC` goes to the probe handler.
-2. A packet matching the existing STUN magic-cookie classifier goes to the
-   STUN handler.
-3. Every other packet follows the existing WireGuard forwarding path.
+1. A `P2PC` prefix is control traffic. Only a 20-byte frame reaches the probe
+   handler; any other length is discarded.
+2. A matching STUN magic-cookie frame reaches STUN processing.
+3. All other datagrams follow the WireGuard forwarding path.
 
-A packet beginning with `P2PC` but having the wrong length is discarded. It
-must never be forwarded to WireGuard. The STUN discriminator already exists;
-the implementation should extend that one receive-routing point to produce
-three destinations rather than create another UDP receive loop.
+This keeps malformed probe-shaped traffic out of WireGuard and uses one
+bounded receive router rather than competing socket receive loops.
 
-## Probe and acknowledgement behavior
+## Exchange and path state
 
-For every compatible remote candidate, an updated peer sends `P2PC` followed
-by the remote record's token from its normal Internet UDP socket.
+An updated peer sends the remote record's token to each compatible remote
+candidate using its normal Internet UDP socket. On receipt of a valid frame:
 
-On receipt:
+- A token equal to the local run token is a probe request and is echoed exactly
+  once from the same socket.
+- A token equal to the remote run token is an acknowledgement only when a
+  probe is outstanding for that exact source candidate. It marks the path
+  **control-verified this run** and records `last_control_response`.
+- Every other frame is discarded.
 
-- If the token equals this connection's own run token, it is a probe request.
-  Echo the exact 20-byte datagram to the source using the same Internet UDP
-  socket.
-- Otherwise, if the token equals a probe currently outstanding to that source,
-  it is an acknowledgement. Record that candidate path as control-verified.
-- Otherwise, silently discard it.
+The responder never echoes a remote token, so the protocol cannot create a
+ping-pong loop. The constant token is a run-scoped capability, not an identity
+or confidentiality mechanism; the configured Curve25519 keys and encrypted
+DHT record remain those mechanisms. A replay of a current-run acknowledgement
+is consequently valid, so verification means control-verified for this run,
+not proof that the path is live at an exact instant.
 
-There is no ping-pong loop. A peer echoes only its own token; the probing peer
-recognizes that echoed remote token only because it has an outstanding probe.
-
-A valid acknowledgement shows that a peer able to decrypt the current
-encrypted DHT record can exchange UDP on the observed path. The static
-configured peer keys remain the identity and confidentiality mechanism. The
-token is a run-scoped capability, not a replacement identity system.
-
-Because the token is intentionally constant for a run, a replayed
-acknowledgement from that run is valid. Therefore status must say
-"control-verified this run" and record a `last_control_response` time; it must
-not claim cryptographic proof that the path is live at this instant.
-
-## Probe schedule
-
-The following schedule applies per candidate path and is driven only by probe
-requests and acknowledgements. It applies even when the WireGuard data plane
-is continuously busy.
+Per candidate, the scheduler is independent of WireGuard traffic:
 
 | Path state | Next control probe |
 | --- | --- |
 | New or unverified | immediately, then after 1 second and 2 seconds |
-| Still no acknowledgement | every 5 seconds |
-| Verified | every 15 seconds |
-| A verified probe has no acknowledgement within 3 seconds | return to the 1-second, 2-second, then 5-second schedule |
+| Still unacknowledged | every 5 seconds, with up to 10% jitter |
+| Verified | every 15 seconds, with up to 10% jitter |
+| A verified request has no acknowledgement within 3 seconds | return to the unverified schedule |
 
-Apply up to 10% random jitter to recurring 5- and 15-second intervals. The
-fast retry path diagnoses failures and recovers quickly; the 15-second steady
-rate keeps an idle UDP path active on common NATs without coupling it to
-WireGuard traffic.
+## Bounds and trust boundary
 
-## Input, resource, and routing constraints
+Candidate and probe-path sets are capped, as are UDP receive queues, reply
+source entries, and outstanding paths. Replies require the exact current local
+token, are fixed-size, and are rate-limited per source; this prevents the
+socket from becoming a useful reflector. IPv4 and IPv6 source candidates are
+kept as exact `SocketAddr` paths, so an acknowledgement cannot validate a
+different address family or source.
 
-- Build and probe only IPv4-to-IPv4 or IPv6-to-IPv6 candidate pairs.
-- Bound stored candidates, outstanding probes, and receive queues.
-- Send replies only for an exact current local token and only one fixed-size
-  frame; rate-limit replies per source. This avoids making the socket a useful
-  UDP reflector.
-- A token, decrypted DHT record, or full probe frame must never be logged.
-- A valid acknowledgement may record its observed source as a peer-reflexive
-  candidate, but arbitrary unsolicited UDP sources must not become data peers.
-- No router mapping, firewall rule, relay, root privilege, or public server is
-  added by this feature.
-
-## Implementation acceptance criteria
-
-1. Preserve the legacy DHT bytes when `control` is absent and prove a 0.1.0
-   decoder accepts the extension.
-2. Unit-test exact frame length, classification, request echo, acknowledgement
-   matching, malformed-input drops, token secrecy in logs, and IPv4/IPv6
-   family separation.
-3. Integration-test two updated peers verifying an idle path and an updated
-   peer retaining normal behavior with a legacy record.
-4. Keep the existing direct data path available to legacy/unverified peers;
-   this design records control health but does not gate WireGuard forwarding.
+Only DHT-authenticated candidates become WireGuard data peers. Unsolicited UDP
+sources are dropped from the data path. The implementation does not add router
+rules, firewall changes, root privileges, a relay, or a public data-path
+server.

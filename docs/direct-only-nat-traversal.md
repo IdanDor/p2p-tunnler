@@ -60,8 +60,8 @@ Useful Rust implementation options are
 
 ## Connection establishment
 
-Updated peers will gain direct control-plane path probes as specified in
-[control-plane-probes.md](control-plane-probes.md). That design keeps the
+Updated peers use direct control-plane path probes as specified in
+[control-plane-probes.md](control-plane-probes.md). The protocol keeps the
 legacy DHT fields and immediate data forwarding intact for unmodified peers;
 it records verified direct paths without introducing a relay or gating
 WireGuard traffic. It is intentionally smaller than a full ICE state machine.
