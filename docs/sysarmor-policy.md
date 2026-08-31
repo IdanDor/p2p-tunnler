@@ -30,6 +30,6 @@ representative syscall allowlist could not be derived. Before using it outside
 this checkout or treating it as a production default-deny policy, generate and
 review a trace while running the actual configuration and connectivity paths.
 
-It is coupled to the debug executable and `/nix/store`. Revalidate it after
-changing the executable location, runtime closure, configuration location, or
-network behavior.
+It is coupled to the debug executable and grants execute access to `/nix/store`
+for its runtime closure. Revalidate it after changing the executable location,
+configuration location, or network behavior.
