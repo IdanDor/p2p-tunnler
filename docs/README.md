@@ -16,6 +16,8 @@
   change entry points.
 - [Operations guide](operations.md): configuration, flags, and connectivity
   diagnosis.
+- [Sysarmor runtime policy](sysarmor-policy.md): strict local runtime
+  confinement for the debug binary and its dedicated configuration directory.
 - [Development and AI-assisted work](development.md): validation, dependency,
   and review requirements.
 - [Deferred audit items](deferred-audit-items.md): compatibility-sensitive
