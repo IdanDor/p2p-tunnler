@@ -27,6 +27,7 @@ socket2 = "0.6"
 async-broadcast = "0.7"
 crab_nat = "0.8.1"
 igd-next = "0.17.1"
+libc = "0.2"
 tokio = { version = "1.53", features = ["rt", "net", "sync", "time"] }
 
 # opendht = { path = "../opendht-rs" }

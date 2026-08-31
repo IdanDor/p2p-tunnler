@@ -34,7 +34,9 @@ remote Curve25519 public keys. For every local/remote pair, the program:
 The DHT key order, JSON field names, Base64 key representation, nonce prefix,
 and ciphertext representation are a protocol contract. They are described in
 detail in [compatibility.md](compatibility.md) and covered by regression
-fixtures.
+fixtures. Received records retain that format but are accepted only when their
+timestamp is no more than ten minutes old or five minutes in the future; equal
+or older records are treated as replays for the current process lifetime.
 
 ## Runtime and tasks
 
@@ -50,7 +52,10 @@ the service.
 
 Router NAT mapping is an opt-in worker because the upstream mapping libraries
 use blocking discovery APIs. It only talks to the local gateway and maintains
-the mapping lease; it does not require privileges on the host.
+the mapping lease; it does not require privileges on the host. Candidate
+gathering owns the worker and asks it to remove the mapping during normal
+shutdown. If renewal fails, the mapping is removed from subsequent candidate
+publications.
 
 ## Address selection
 

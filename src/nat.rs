@@ -8,6 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::num::NonZeroU16;
 use std::sync::mpsc;
 use std::time::Duration;
+use tokio::sync::watch;
 
 const MAPPING_LIFETIME_SECONDS: u32 = 7_200;
 const MAPPING_RENEWAL_MINIMUM: Duration = Duration::from_secs(60);
@@ -18,10 +19,30 @@ const MAPPING_TIMEOUT: TimeoutConfig = TimeoutConfig {
     max_retry_timeout: Some(Duration::from_secs(1)),
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct Mapping {
     pub external_addr: SocketAddr,
     pub method: Method,
+    active: watch::Receiver<bool>,
+    shutdown: Option<mpsc::SyncSender<()>>,
+}
+
+impl Mapping {
+    pub fn is_active(&self) -> bool {
+        *self.active.borrow()
+    }
+
+    pub async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        self.active.changed().await
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.try_send(());
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -49,10 +70,22 @@ impl std::fmt::Display for Method {
 pub async fn map_udp_port(log: slog::Logger, port: u16) -> anyhow::Result<Mapping> {
     let port = NonZeroU16::new(port).context("Cannot request a NAT mapping for UDP port 0")?;
     let (sender, receiver) = mpsc::sync_channel(1);
+    let (shutdown_sender, shutdown_receiver) = mpsc::sync_channel(1);
+    let (active_sender, active_receiver) = watch::channel(true);
 
     std::thread::Builder::new()
         .name("p2p-tunnler-nat-map".to_string())
-        .spawn(move || mapping_worker(log, port, sender))
+        .spawn(move || {
+            mapping_worker(
+                log,
+                port,
+                sender,
+                shutdown_sender,
+                shutdown_receiver,
+                active_sender,
+                active_receiver,
+            )
+        })
         .context("Failed to start NAT mapping worker")?;
 
     tokio::task::spawn_blocking(move || {
@@ -67,16 +100,46 @@ fn mapping_worker(
     log: slog::Logger,
     port: NonZeroU16,
     sender: mpsc::SyncSender<anyhow::Result<Mapping>>,
+    shutdown_sender: mpsc::SyncSender<()>,
+    shutdown_receiver: mpsc::Receiver<()>,
+    active_sender: watch::Sender<bool>,
+    active_receiver: watch::Receiver<bool>,
 ) {
     match try_pcp_natpmp(port) {
-        Ok((mapping, runtime, lease)) => {
-            let _ = sender.send(Ok(mapping));
-            renew_pcp_natpmp(log, runtime, lease);
+        Ok((external_addr, method, runtime, lease)) => {
+            let mapping = Mapping {
+                external_addr,
+                method,
+                active: active_receiver,
+                shutdown: Some(shutdown_sender),
+            };
+            if sender.send(Ok(mapping)).is_ok() {
+                renew_pcp_natpmp(log, runtime, lease, shutdown_receiver, active_sender);
+            } else {
+                remove_pcp_natpmp_mapping(&log, runtime, lease);
+            }
         }
         Err(pcp_error) => match try_upnp_igd(port) {
-            Ok((mapping, gateway, local_addr)) => {
-                let _ = sender.send(Ok(mapping));
-                renew_upnp_igd(log, gateway, mapping.external_addr.port(), local_addr);
+            Ok((external_addr, gateway, local_addr)) => {
+                let external_port = external_addr.port();
+                let mapping = Mapping {
+                    external_addr,
+                    method: Method::UpnpIgd,
+                    active: active_receiver,
+                    shutdown: Some(shutdown_sender),
+                };
+                if sender.send(Ok(mapping)).is_ok() {
+                    renew_upnp_igd(
+                        log,
+                        gateway,
+                        external_port,
+                        local_addr,
+                        shutdown_receiver,
+                        active_sender,
+                    );
+                } else {
+                    remove_upnp_igd_mapping(&log, gateway, external_port);
+                }
             }
             Err(upnp_error) => {
                 let _ = sender.send(Err(anyhow!(
@@ -89,7 +152,7 @@ fn mapping_worker(
 
 fn try_pcp_natpmp(
     port: NonZeroU16,
-) -> anyhow::Result<(Mapping, tokio::runtime::Runtime, PortMapping)> {
+) -> anyhow::Result<(SocketAddr, Method, tokio::runtime::Runtime, PortMapping)> {
     let (gateway, client) = default_ipv4_gateway_and_client()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -137,30 +200,51 @@ fn try_pcp_natpmp(
         PortMappingType::NatPmp => Method::NatPmp,
     };
     Ok((
-        Mapping {
-            external_addr: SocketAddr::new(external_ip, mapping.external_port().get()),
-            method,
-        },
+        SocketAddr::new(external_ip, mapping.external_port().get()),
+        method,
         runtime,
         mapping,
     ))
 }
 
-fn renew_pcp_natpmp(log: slog::Logger, runtime: tokio::runtime::Runtime, mut mapping: PortMapping) {
+fn renew_pcp_natpmp(
+    log: slog::Logger,
+    runtime: tokio::runtime::Runtime,
+    mut mapping: PortMapping,
+    shutdown: mpsc::Receiver<()>,
+    active: watch::Sender<bool>,
+) {
     loop {
         let renewal_delay =
             Duration::from_secs(u64::from(mapping.lifetime()) / 2).max(MAPPING_RENEWAL_MINIMUM);
-        std::thread::sleep(renewal_delay);
+        match shutdown.recv_timeout(renewal_delay) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                remove_pcp_natpmp_mapping(&log, runtime, mapping);
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
 
         if let Err(error) = runtime.block_on(mapping.renew()) {
             slog::error!(log, "NAT mapping renewal failed"; "error" => format!("{error:#}"));
+            active.send_replace(false);
             return;
         }
         slog::debug!(log, "NAT mapping renewed"; "method" => format!("{:?}", mapping.mapping_type()));
     }
 }
 
-fn try_upnp_igd(port: NonZeroU16) -> anyhow::Result<(Mapping, igd_next::Gateway, SocketAddr)> {
+fn remove_pcp_natpmp_mapping(
+    log: &slog::Logger,
+    runtime: tokio::runtime::Runtime,
+    mapping: PortMapping,
+) {
+    if let Err((error, _mapping)) = runtime.block_on(mapping.try_drop()) {
+        slog::error!(log, "Failed to remove NAT mapping"; "error" => format!("{error:#}"));
+    }
+}
+
+fn try_upnp_igd(port: NonZeroU16) -> anyhow::Result<(SocketAddr, igd_next::Gateway, SocketAddr)> {
     let (_, client) = default_ipv4_gateway_and_client()?;
     let local_addr = SocketAddr::new(IpAddr::V4(client), port.get());
     let gateway = igd_next::search_gateway(SearchOptions {
@@ -178,14 +262,7 @@ fn try_upnp_igd(port: NonZeroU16) -> anyhow::Result<(Mapping, igd_next::Gateway,
             "p2p-tunnler",
         )
         .context("UPnP IGD port mapping failed")?;
-    Ok((
-        Mapping {
-            external_addr,
-            method: Method::UpnpIgd,
-        },
-        gateway,
-        local_addr,
-    ))
+    Ok((external_addr, gateway, local_addr))
 }
 
 fn renew_upnp_igd(
@@ -193,9 +270,17 @@ fn renew_upnp_igd(
     gateway: igd_next::Gateway,
     external_port: u16,
     local_addr: SocketAddr,
+    shutdown: mpsc::Receiver<()>,
+    active: watch::Sender<bool>,
 ) {
     loop {
-        std::thread::sleep(Duration::from_secs(u64::from(MAPPING_LIFETIME_SECONDS) / 2));
+        match shutdown.recv_timeout(Duration::from_secs(u64::from(MAPPING_LIFETIME_SECONDS) / 2)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                remove_upnp_igd_mapping(&log, gateway, external_port);
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
         if let Err(error) = gateway.add_port(
             PortMappingProtocol::UDP,
             external_port,
@@ -204,9 +289,16 @@ fn renew_upnp_igd(
             "p2p-tunnler",
         ) {
             slog::error!(log, "UPnP IGD mapping renewal failed"; "error" => format!("{error:#}"));
+            active.send_replace(false);
             return;
         }
         slog::debug!(log, "UPnP IGD mapping renewed"; "external_port" => external_port);
+    }
+}
+
+fn remove_upnp_igd_mapping(log: &slog::Logger, gateway: igd_next::Gateway, external_port: u16) {
+    if let Err(error) = gateway.remove_port(PortMappingProtocol::UDP, external_port) {
+        slog::error!(log, "Failed to remove UPnP IGD mapping"; "error" => format!("{error:#}"));
     }
 }
 

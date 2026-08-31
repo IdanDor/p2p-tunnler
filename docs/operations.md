@@ -31,7 +31,7 @@ p2p-tunnler stun
 p2p-tunnler run /secure/path/tunnels.yaml
 ```
 
-Add `--verbose` before the subcommand for structured debug logs. Logs include
+Add `--verbose` before the subcommand for debug logs. Logs include
 candidate addresses and packet metadata, but never secret keys or decrypted
 DHT payloads.
 
@@ -53,7 +53,8 @@ mapping; the service continues with STUN candidates and logs the result.
 `--out-port` is a single Internet UDP port. A configuration with more than one
 peer must use the default ephemeral ports or run one process per peer when
 manual forwarding is required; startup rejects an ambiguous multi-peer fixed
-port request before opening sockets.
+port request before opening sockets. It accepts `0` or unprivileged ports
+`1025..=65535`, matching peer-candidate validation.
 
 ## Diagnosing no packets
 

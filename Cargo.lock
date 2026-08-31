@@ -1104,6 +1104,7 @@ dependencies = [
  "crypto_box",
  "futures",
  "igd-next",
+ "libc",
  "opendht",
  "rand",
  "serde",

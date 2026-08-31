@@ -17,6 +17,9 @@ use crate::stun;
 use crate::transport::Connections;
 use crate::utils::{TaskMonitor, UdpReceiver, UdpSender, spawn};
 
+const MAX_DHT_MESSAGE_AGE: Duration = Duration::from_secs(10 * 60);
+const MAX_DHT_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
+
 pub fn dht_key(publisher: &PublicKey, subscriber: &PublicKey) -> Vec<u8> {
     let mut key = Vec::with_capacity(64);
     key.extend_from_slice(publisher.as_bytes());
@@ -52,6 +55,15 @@ fn parse_dht_message(log: &slog::Logger, plaintext: &[u8]) -> Option<Message> {
     }
 }
 
+fn is_fresh_dht_timestamp(timestamp: SystemTime, now: SystemTime) -> bool {
+    match timestamp.duration_since(now) {
+        Ok(future_skew) => future_skew <= MAX_DHT_FUTURE_SKEW,
+        Err(_) => now
+            .duration_since(timestamp)
+            .is_ok_and(|age| age <= MAX_DHT_MESSAGE_AGE),
+    }
+}
+
 pub async fn listen_for_peer_candidates(
     log: slog::Logger,
     dht: OpenDht,
@@ -75,6 +87,10 @@ pub async fn listen_for_peer_candidates(
         let Some(message) = parse_dht_message(&log, &plaintext) else {
             continue;
         };
+        if !is_fresh_dht_timestamp(message.timestamp, SystemTime::now()) {
+            slog::debug!(log, "Ignoring DHT message with an implausible timestamp");
+            continue;
+        }
 
         let message_timestamp = message
             .timestamp
@@ -88,8 +104,8 @@ pub async fn listen_for_peer_candidates(
                 .ok()
         });
         slog::debug!(log, "DHT message timestamp compared"; "message_timestamp" => message_timestamp, "last_timestamp" => previous_timestamp);
-        if last_timestamp.is_some_and(|last| message.timestamp < last) {
-            slog::debug!(log, "Ignoring stale DHT message"; "message_timestamp" => message_timestamp, "last_timestamp" => previous_timestamp);
+        if last_timestamp.is_some_and(|last| message.timestamp <= last) {
+            slog::debug!(log, "Ignoring stale or replayed DHT message"; "message_timestamp" => message_timestamp, "last_timestamp" => previous_timestamp);
             continue;
         }
         last_timestamp = Some(message.timestamp);
@@ -239,7 +255,7 @@ async fn lookup_public_address(lookup: StunLookup) -> anyhow::Result<()> {
         candidates,
         local_port,
         gather_ipv6,
-        nat_mapping,
+        mut nat_mapping,
         run_once,
     } = lookup;
     let stun = stun::Stun;
@@ -272,35 +288,47 @@ async fn lookup_public_address(lookup: StunLookup) -> anyhow::Result<()> {
             .lookup_public_address(&log, &mut to_internet, &mut from_internet, server)
             .await
         {
-            Ok(connectivity) => {
-                let address: Option<SocketAddr> = connectivity.into();
-                if let Some(address) = address {
-                    if let Some(mapping) = nat_mapping
-                        && mapping.external_addr.ip() == address.ip()
-                    {
+            Ok(address) => {
+                if let Some(mapping) = nat_mapping.as_ref() {
+                    if !mapping.is_active() {
+                        slog::info!(log, "Ignoring inactive router mapping"; "mapping" => mapping.external_addr, "method" => mapping.method.to_string());
+                    } else if mapping.external_addr.ip() == address.ip() {
                         addresses.push(mapping.external_addr);
-                    } else if let Some(mapping) = nat_mapping {
+                    } else {
                         slog::info!(log, "Ignoring router mapping with a different public IP than STUN"; "mapping" => mapping.external_addr, "method" => mapping.method.to_string(), "stun" => address);
                     }
-                    addresses.push(address);
                 }
+                addresses.push(address);
                 if previous_addresses != addresses {
                     slog::info!(log, "STUN found new addresses"; "addr" => format!("{addresses:?}"));
                     previous_addresses = addresses.clone();
                 }
                 candidates.broadcast_direct(addresses).await?;
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                wait_for_next_stun_attempt(&mut nat_mapping, Duration::from_secs(60)).await;
             }
             Err(error) => {
                 slog::error!(log, "STUN failed"; "error" => format!("{error:#}"));
                 candidates.broadcast_direct(addresses).await?;
-                tokio::time::sleep(Duration::from_secs(15)).await;
+                wait_for_next_stun_attempt(&mut nat_mapping, Duration::from_secs(15)).await;
             }
         }
 
         if run_once {
             return Ok(());
         }
+    }
+}
+
+async fn wait_for_next_stun_attempt(mapping: &mut Option<nat::Mapping>, delay: Duration) {
+    if let Some(mapping) = mapping {
+        if matches!(
+            tokio::time::timeout(delay, mapping.changed()).await,
+            Ok(Err(_))
+        ) {
+            tokio::time::sleep(delay).await;
+        }
+    } else {
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -318,12 +346,13 @@ async fn get_local_ipv6_addr() -> anyhow::Result<Option<IpAddr>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dht_key, is_usable_peer_addr, local_ipv6_candidate, parse_dht_message,
-        retained_known_connections,
+        MAX_DHT_FUTURE_SKEW, dht_key, is_fresh_dht_timestamp, is_usable_peer_addr,
+        local_ipv6_candidate, parse_dht_message, retained_known_connections,
     };
     use crate::crypto::PublicKey;
     use std::collections::HashSet;
     use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+    use std::time::{Duration, SystemTime};
 
     #[test]
     fn accepts_the_full_unprivileged_port_range() {
@@ -368,5 +397,20 @@ mod tests {
     fn malformed_dht_messages_are_ignored() {
         let log = slog::Logger::root(slog::Discard, slog::o!());
         assert!(parse_dht_message(&log, br#"{"timestamp":{}}"#).is_none());
+    }
+
+    #[test]
+    fn rejects_dht_timestamps_outside_the_freshness_window() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(is_fresh_dht_timestamp(now, now));
+        assert!(is_fresh_dht_timestamp(now + MAX_DHT_FUTURE_SKEW, now));
+        assert!(!is_fresh_dht_timestamp(
+            now + MAX_DHT_FUTURE_SKEW + Duration::from_secs(1),
+            now
+        ));
+        assert!(!is_fresh_dht_timestamp(
+            now - Duration::from_secs(10 * 60 + 1),
+            now
+        ));
     }
 }

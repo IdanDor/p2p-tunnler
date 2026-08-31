@@ -3368,6 +3368,10 @@ rec {
             packageId = "igd-next";
           }
           {
+            name = "libc";
+            packageId = "libc";
+          }
+          {
             name = "opendht";
             packageId = "opendht";
           }

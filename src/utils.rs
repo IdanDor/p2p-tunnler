@@ -1,25 +1,40 @@
 use std::future::Future;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use futures::FutureExt;
 use tokio::sync::{mpsc, watch};
 
 pub const UDP_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Clone)]
 pub struct TaskMonitor {
-    failure_sender: watch::Sender<Option<&'static str>>,
+    failure_sender: watch::Sender<Option<TaskFailure>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskFailure {
+    pub task: &'static str,
+    pub error: String,
 }
 
 impl TaskMonitor {
-    pub fn new() -> (Self, watch::Receiver<Option<&'static str>>) {
+    pub fn new() -> (Self, watch::Receiver<Option<TaskFailure>>) {
         let (failure_sender, failure_receiver) = watch::channel(None);
         (Self { failure_sender }, failure_receiver)
     }
 
-    fn report_failure(&self, task: &'static str) {
-        self.failure_sender.send_replace(Some(task));
+    fn report_failure(&self, task: &'static str, error: String) {
+        self.failure_sender.send_if_modified(|failure| {
+            if failure.is_some() {
+                false
+            } else {
+                *failure = Some(TaskFailure { task, error });
+                true
+            }
+        });
     }
 }
 
@@ -28,9 +43,22 @@ where
     F: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
     tokio::spawn(async move {
-        if let Err(error) = future.await {
-            slog::error!(log, "Background task stopped"; "task" => task, "error" => format!("{error:#}"));
-            monitor.report_failure(task);
+        match AssertUnwindSafe(future).catch_unwind().await {
+            Ok(Ok(())) => {
+                let error = "task ended unexpectedly".to_string();
+                slog::error!(log, "Background task stopped"; "task" => task, "error" => error.clone());
+                monitor.report_failure(task, error);
+            }
+            Ok(Err(error)) => {
+                let error = format!("{error:#}");
+                slog::error!(log, "Background task stopped"; "task" => task, "error" => error.clone());
+                monitor.report_failure(task, error);
+            }
+            Err(_) => {
+                let error = "task panicked".to_string();
+                slog::error!(log, "Background task panicked"; "task" => task);
+                monitor.report_failure(task, error);
+            }
         }
     });
 }
@@ -91,7 +119,7 @@ pub fn split_udp_socket(
 
 #[cfg(test)]
 mod tests {
-    use super::{TaskMonitor, split_udp_socket, try_send};
+    use super::{TaskMonitor, spawn, split_udp_socket, try_send};
     use anyhow::Context;
     use std::time::Duration;
 
@@ -142,5 +170,59 @@ mod tests {
         assert_eq!(receiver.try_recv()?, 1);
 
         Ok(())
+    }
+
+    #[test]
+    fn reports_an_unexpected_clean_task_exit() -> anyhow::Result<()> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let (monitor, mut failures) = TaskMonitor::new();
+                spawn(
+                    monitor,
+                    slog::Logger::root(slog::Discard, slog::o!()),
+                    "clean exit",
+                    async { Ok(()) },
+                );
+
+                tokio::time::timeout(Duration::from_secs(1), failures.changed()).await??;
+                let failure = failures
+                    .borrow_and_update()
+                    .clone()
+                    .expect("failure reported");
+                assert_eq!(failure.task, "clean exit");
+                assert_eq!(failure.error, "task ended unexpectedly");
+                Ok(())
+            })
+    }
+
+    #[test]
+    fn reports_a_task_panic() -> anyhow::Result<()> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let (monitor, mut failures) = TaskMonitor::new();
+                spawn(
+                    monitor,
+                    slog::Logger::root(slog::Discard, slog::o!()),
+                    "panic",
+                    async {
+                        panic!("test panic");
+                        #[allow(unreachable_code)]
+                        Ok(())
+                    },
+                );
+
+                tokio::time::timeout(Duration::from_secs(1), failures.changed()).await??;
+                let failure = failures
+                    .borrow_and_update()
+                    .clone()
+                    .expect("failure reported");
+                assert_eq!(failure.task, "panic");
+                assert_eq!(failure.error, "task panicked");
+                Ok(())
+            })
     }
 }

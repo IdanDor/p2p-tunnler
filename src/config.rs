@@ -111,6 +111,7 @@ pub struct ConnectionFlags {
         short,
         long,
         help = "The local out going port, default is 0 which means a random port is set",
+        value_parser = parse_out_port,
         default_value_t = 0
     )]
     pub out_port: u16,
@@ -120,6 +121,17 @@ pub struct ConnectionFlags {
         help = "Request a direct inbound UDP mapping from the local router using PCP, NAT-PMP, or UPnP IGD"
     )]
     pub nat_map: bool,
+}
+
+fn parse_out_port(value: &str) -> Result<u16, String> {
+    let port = value
+        .parse::<u16>()
+        .map_err(|error| format!("invalid UDP port: {error}"))?;
+    if port == 0 || port > 1024 {
+        Ok(port)
+    } else {
+        Err("must be 0 or an unprivileged UDP port (1025-65535)".to_string())
+    }
 }
 
 #[derive(Args, Debug)]
@@ -208,7 +220,7 @@ impl CliConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::P2PConnection;
+    use super::{P2PConnection, parse_out_port};
 
     #[test]
     fn debug_output_redacts_the_secret_key() {
@@ -220,5 +232,13 @@ mod tests {
         let debug_output = format!("{connection:?}");
         assert!(debug_output.contains("<redacted>"));
         assert!(!debug_output.contains(&connection.secret_key));
+    }
+
+    #[test]
+    fn out_port_accepts_ephemeral_or_unprivileged_ports() {
+        assert_eq!(parse_out_port("0"), Ok(0));
+        assert_eq!(parse_out_port("1025"), Ok(1025));
+        assert!(parse_out_port("1024").is_err());
+        assert!(parse_out_port("65536").is_err());
     }
 }

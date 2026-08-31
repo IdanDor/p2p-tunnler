@@ -188,8 +188,8 @@ impl StunCodec {
         })
     }
 
-    pub fn decode_const(expected_id: u64, msg: Vec<u8>) -> Result<Option<Response>> {
-        let mut header = Cursor::new(msg.as_slice());
+    pub fn decode_const(expected_id: u64, msg: &[u8]) -> Result<Option<Response>> {
+        let mut header = Cursor::new(msg);
 
         let msg_type = header.read_u16::<NetworkEndian>()?;
         let message_length = usize::from(header.read_u16::<NetworkEndian>()?);
@@ -565,7 +565,7 @@ mod tests {
         );
 
         let Some(Response::Bind(binding)) =
-            StunCodec::decode_const(transaction_id, response).unwrap()
+            StunCodec::decode_const(transaction_id, &response).unwrap()
         else {
             panic!("expected a binding response");
         };
@@ -591,6 +591,6 @@ mod tests {
         response.write_u16::<NetworkEndian>(1).unwrap();
         response.extend([0, 0, 0, 0]);
 
-        assert!(StunCodec::decode_const(transaction_id, response).is_err());
+        assert!(StunCodec::decode_const(transaction_id, &response).is_err());
     }
 }

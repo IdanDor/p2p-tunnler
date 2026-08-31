@@ -7,7 +7,7 @@ use futures::future::join_all;
 use crate::candidates::{
     StunSetup, listen_for_peer_candidates, publish_candidates, start_stun_candidates,
 };
-use crate::config::{ConnectionFlags, P2PConnection, RunCommand, StunFlags};
+use crate::config::{ConnectionFlags, P2PConnection, Peer, RunCommand, StunFlags};
 use crate::crypto::{PublicKey, SecretKey};
 use crate::dht::OpenDht;
 use crate::stun::codec::MAGIC_COOKIE;
@@ -33,6 +33,7 @@ pub async fn start_dht(
 }
 
 pub async fn run(log: &slog::Logger, command: &RunCommand) -> anyhow::Result<()> {
+    validate_connections(&command.connections)?;
     let peer_count: usize = command
         .connections
         .iter()
@@ -72,10 +73,31 @@ pub async fn run(log: &slog::Logger, command: &RunCommand) -> anyhow::Result<()>
         .changed()
         .await
         .context("Task supervision stopped unexpectedly")?;
+    let failure =
+        failures
+            .borrow_and_update()
+            .clone()
+            .unwrap_or_else(|| crate::utils::TaskFailure {
+                task: "unknown task",
+                error: "failure notification did not include a reason".to_string(),
+            });
     bail!(
-        "Background task stopped: {}",
-        failures.borrow_and_update().unwrap_or("unknown task")
+        "Background task stopped: {}: {}",
+        failure.task,
+        failure.error
     )
+}
+
+fn validate_connections(connections: &[P2PConnection]) -> anyhow::Result<()> {
+    for (connection_index, connection) in connections.iter().enumerate() {
+        SecretKey::try_from(connection.secret_key.as_str()).map_err(|error| {
+            anyhow!("Failed to parse secret key for connection {connection_index}: {error}")
+        })?;
+        for (peer_index, peer) in connection.peers.iter().enumerate() {
+            parse_peer_key(peer, peer_index)?;
+        }
+    }
+    Ok(())
 }
 
 async fn setup_connection(
@@ -89,14 +111,8 @@ async fn setup_connection(
     let secret_key = SecretKey::try_from(config.secret_key.as_str())
         .map_err(|error| anyhow!("Failed to parse own secret key: {error}"))?;
 
-    for peer in &config.peers {
-        let remote_key = match PublicKey::try_from(peer.public_key.as_str()) {
-            Ok(key) => key,
-            Err(error) => {
-                slog::error!(log, "Failed to parse peer public key"; "error" => format!("{error:#}"));
-                continue;
-            }
-        };
+    for (peer_index, peer) in config.peers.iter().enumerate() {
+        let remote_key = parse_peer_key(peer, peer_index)?;
         let peer_log = peer
             .name
             .as_ref()
@@ -182,6 +198,15 @@ async fn setup_connection(
     Ok(())
 }
 
+fn parse_peer_key(peer: &Peer, peer_index: usize) -> anyhow::Result<PublicKey> {
+    PublicKey::try_from(peer.public_key.as_str()).map_err(|error| {
+        anyhow!(
+            "Failed to parse public key for peer {peer_index} ({}): {error}",
+            peer.name.as_deref().unwrap_or("unnamed")
+        )
+    })
+}
+
 async fn request_nat_mapping(log: &slog::Logger, local_port: u16) -> Option<crate::nat::Mapping> {
     slog::info!(log, "Requesting local-router UDP mapping"; "local_port" => local_port);
     match crate::nat::map_udp_port(log.clone(), local_port).await {
@@ -193,5 +218,37 @@ async fn request_nat_mapping(log: &slog::Logger, local_port: u16) -> Option<crat
             slog::error!(log, "Local-router UDP mapping unavailable; continuing with STUN"; "error" => format!("{error:#}"));
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_peer_key, validate_connections};
+    use crate::config::{P2PConnection, Peer};
+
+    #[test]
+    fn malformed_peer_key_fails_startup_validation_without_echoing_it() {
+        let peer = Peer {
+            local_port: 10001,
+            public_key: "not-a-key".to_string(),
+            name: Some("desktop".to_string()),
+        };
+
+        let error = match parse_peer_key(&peer, 0) {
+            Ok(_) => panic!("malformed key was accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("peer 0 (desktop)"));
+        assert!(!error.contains(&peer.public_key));
+    }
+
+    #[test]
+    fn invalid_configuration_is_rejected_before_service_setup() {
+        let connection = P2PConnection {
+            secret_key: "not-a-key".to_string(),
+            peers: vec![],
+        };
+
+        assert!(validate_connections(&[connection]).is_err());
     }
 }

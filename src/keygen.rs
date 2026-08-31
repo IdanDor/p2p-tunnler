@@ -60,8 +60,13 @@ fn open_private_key_file(path: &str, flags: &GenFlags) -> anyhow::Result<File> {
     let mut options = OpenOptions::new();
     configure_output_file(&mut options, flags.override_files);
     #[cfg(unix)]
-    if !flags.insecure_priv {
-        options.mode(0o600);
+    {
+        if !flags.insecure_priv {
+            options.mode(0o600);
+        }
+        if flags.override_files {
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
     }
     let file = options
         .open(path)
@@ -80,6 +85,10 @@ fn open_private_key_file(path: &str, flags: &GenFlags) -> anyhow::Result<File> {
 fn open_output_file(path: &str, override_files: bool, description: &str) -> anyhow::Result<File> {
     let mut options = OpenOptions::new();
     configure_output_file(&mut options, override_files);
+    #[cfg(unix)]
+    if override_files {
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
     options
         .open(path)
         .with_context(|| format!("Failed to open {description} file for writing"))
@@ -103,6 +112,9 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::time::SystemTime;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn overriding_a_private_key_file_truncates_and_secures_it() -> anyhow::Result<()> {
@@ -132,6 +144,32 @@ mod tests {
 
         fs::remove_file(&path)?;
         fs::remove_file(public_path)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overriding_a_key_file_rejects_a_symlink() -> anyhow::Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("p2p-tunnler-key-symlink-{unique}"));
+        fs::create_dir(&directory)?;
+        let target = directory.join("target");
+        let link = directory.join("private-key");
+        fs::write(&target, b"do-not-overwrite")?;
+        symlink(&target, &link)?;
+
+        let flags = GenFlags {
+            path: Some(link.to_string_lossy().to_string()),
+            pub_path: None,
+            insecure_priv: false,
+            override_files: true,
+        };
+        assert!(open_key_files(&flags).is_err());
+        assert_eq!(fs::read(&target)?, b"do-not-overwrite");
+
+        fs::remove_dir_all(directory)?;
         Ok(())
     }
 }

@@ -2,10 +2,8 @@ pub mod codec;
 
 use anyhow::{anyhow, bail};
 
-use slog::{debug, info};
+use slog::debug;
 
-use std::net::IpAddr;
-use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -15,35 +13,10 @@ use rand::{RngExt, rngs::SmallRng};
 
 use tokio::sync::Mutex;
 
-//pub const NETWORK_UNREACHABLE: i32 = 101;
-
 use crate::stun::codec::*;
 use crate::utils::{UdpReceiver, UdpSender, try_send};
 
 static RNG: LazyLock<Mutex<SmallRng>> = LazyLock::new(|| Mutex::new(rand::make_rng()));
-
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum Connectivity {
-    OpenInternet(SocketAddr),
-    FullConeNat(SocketAddr),
-    SymmetricNat,
-    RestrictedPortNat(SocketAddr),
-    RestrictedConeNat(SocketAddr),
-    SymmetricFirewall(SocketAddr),
-}
-
-impl From<Connectivity> for Option<SocketAddr> {
-    fn from(val: Connectivity) -> Self {
-        match val {
-            Connectivity::OpenInternet(addr) => Some(addr),
-            Connectivity::FullConeNat(addr) => Some(addr),
-            Connectivity::SymmetricNat => None,
-            Connectivity::RestrictedPortNat(addr) => Some(addr),
-            Connectivity::RestrictedConeNat(addr) => Some(addr),
-            Connectivity::SymmetricFirewall(addr) => Some(addr),
-        }
-    }
-}
 
 pub struct Stun;
 
@@ -54,129 +27,12 @@ impl Stun {
         to_inet_tx: &mut UdpSender,
         from_inet_rx: &mut UdpReceiver,
         stun_server: SocketAddr,
-    ) -> anyhow::Result<Connectivity> {
-        let bind_addr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-        let conn = check(stun_log, to_inet_tx, from_inet_rx, bind_addr, stun_server).await?;
-        Ok(conn)
+    ) -> anyhow::Result<SocketAddr> {
+        let request = Request::Bind(BindRequest::default());
+        match send_request(stun_log, to_inet_tx, from_inet_rx, stun_server, request).await? {
+            Response::Bind(response) => Ok(response.mapped_address),
+        }
     }
-}
-
-async fn check(
-    stun_log: &slog::Logger,
-    to_inet_tx: &mut UdpSender,
-    from_inet_rx: &mut UdpReceiver,
-    bind_addr: IpAddr,
-    stun_server: SocketAddr,
-) -> Result<Connectivity, anyhow::Error> {
-    let resp = change_request(
-        stun_log,
-        to_inet_tx,
-        from_inet_rx,
-        stun_server,
-        ChangeRequest::None,
-    )
-    .await?;
-    if let Some(Response::Bind(resp)) = resp {
-        let public_addr = resp.mapped_address;
-
-        if bind_addr == public_addr.ip() {
-            debug!(
-                stun_log,
-                "No NAT. Public IP ({}) == Bind IP ({})",
-                bind_addr,
-                public_addr.ip()
-            );
-            let resp = change_request(
-                stun_log,
-                to_inet_tx,
-                from_inet_rx,
-                stun_server,
-                ChangeRequest::IpAndPort,
-            )
-            .await?;
-            if resp.is_some() {
-                info!(stun_log, "OpenInternet: {}", public_addr);
-                return Ok(Connectivity::OpenInternet(public_addr));
-            } else {
-                info!(stun_log, "SymmetricFirewall: {}", public_addr);
-                return Ok(Connectivity::SymmetricFirewall(public_addr));
-            }
-        }
-        debug!(
-            stun_log,
-            "Public IP ({}) != Bind IP ({})",
-            bind_addr,
-            public_addr.ip()
-        );
-
-        // NAT detected
-        let resp = change_request(
-            stun_log,
-            to_inet_tx,
-            from_inet_rx,
-            stun_server,
-            ChangeRequest::IpAndPort,
-        )
-        .await?;
-        if resp.is_some() {
-            info!(stun_log, "FullConeNat: {}", public_addr);
-            return Ok(Connectivity::FullConeNat(public_addr));
-        }
-
-        debug!(stun_log, "No respone from different IP and Port");
-        let resp = change_request(
-            stun_log,
-            to_inet_tx,
-            from_inet_rx,
-            stun_server,
-            ChangeRequest::Port,
-        )
-        .await?;
-        if let Some(Response::Bind(resp)) = resp {
-            if resp.mapped_address.ip() != public_addr.ip() {
-                info!(stun_log, "SymmetricNat");
-                return Ok(Connectivity::SymmetricNat);
-            }
-
-            let resp = change_request(
-                stun_log,
-                to_inet_tx,
-                from_inet_rx,
-                stun_server,
-                ChangeRequest::Port,
-            )
-            .await?;
-            if resp.is_some() {
-                info!(stun_log, "RestrictedConeNat: {}", public_addr);
-                Ok(Connectivity::RestrictedConeNat(public_addr))
-            } else {
-                info!(stun_log, "RestrictedPortNat: {}", public_addr);
-                Ok(Connectivity::RestrictedPortNat(public_addr))
-            }
-        } else {
-            Err(anyhow!(
-                "Expected Some(BindResponse) but got {:?} instead!",
-                resp
-            ))
-        }
-    } else {
-        Err(anyhow!("Network unreachable"))
-    }
-}
-
-async fn change_request(
-    stun_log: &slog::Logger,
-    to_inet_tx: &mut UdpSender,
-    from_inet_rx: &mut UdpReceiver,
-    stun_server: SocketAddr,
-    req: ChangeRequest,
-) -> Result<Option<Response>, anyhow::Error> {
-    let req = codec::Request::Bind(BindRequest {
-        change_request: req,
-        ..Default::default()
-    });
-
-    send_request(stun_log, to_inet_tx, from_inet_rx, stun_server, req).await
 }
 
 async fn send_request(
@@ -185,9 +41,11 @@ async fn send_request(
     from_inet_rx: &mut UdpReceiver,
     stun_server: SocketAddr,
     req: Request,
-) -> Result<Option<Response>, anyhow::Error> {
-    let mut lock = RNG.lock().await;
-    let id: u64 = lock.random();
+) -> Result<Response, anyhow::Error> {
+    let id: u64 = {
+        let mut rng = RNG.lock().await;
+        rng.random()
+    };
 
     let mut buf = bytes::BytesMut::new();
     StunCodec::encode((id, req.clone()), &mut buf)?;
@@ -209,17 +67,42 @@ async fn send_request(
                 debug!(stun_log, "STUN socket receiver closed");
                 break;
             }
-            Ok(Some((buf, _src))) => {
-                let buf = buf.into_iter().collect();
-                debug!(stun_log, "Got packet for stun {:?}", buf);
-                if let Some(resp) = StunCodec::decode_const(id, buf)? {
-                    return Ok(Some(resp));
-                } else {
+            Ok(Some((buf, source))) => {
+                if !is_expected_stun_source(source, stun_server) {
+                    debug!(stun_log, "Ignoring STUN response from unexpected source"; "src" => source, "expected" => stun_server, "bytes" => buf.len());
                     continue;
+                }
+                debug!(stun_log, "Received STUN response"; "src" => source, "bytes" => buf.len());
+                if let Some(response) = StunCodec::decode_const(id, &buf)? {
+                    return Ok(response);
                 }
             }
         }
     }
 
     Err(anyhow!("Failed to get stun response"))
+}
+
+fn is_expected_stun_source(source: SocketAddr, stun_server: SocketAddr) -> bool {
+    source == stun_server
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_expected_stun_source;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn accepts_only_the_configured_stun_server() {
+        let server: SocketAddr = "192.0.2.1:3478".parse().unwrap();
+        assert!(is_expected_stun_source(server, server));
+        assert!(!is_expected_stun_source(
+            "192.0.2.2:3478".parse().unwrap(),
+            server
+        ));
+        assert!(!is_expected_stun_source(
+            "192.0.2.1:3479".parse().unwrap(),
+            server
+        ));
+    }
 }

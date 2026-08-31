@@ -55,8 +55,8 @@ async fn run_stun(log: &slog::Logger, flags: &crate::config::StunFlags) -> anyho
         candidates.recv().await
     );
     // Let the asynchronous terminal drain flush the final result before this
-    // short-lived diagnostic command exits.
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // short-lived diagnostic command exits without blocking the runtime.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     Ok(())
 }
 
@@ -69,11 +69,11 @@ async fn run_dht_diagnostic(
     let key = [9, 9, 9];
     let value = [1, 1, 1, 2];
     dht.put(&key, &value).await?;
-    slog::debug!(log, "put done: {:?}", value);
+    slog::debug!(log, "DHT diagnostic value stored"; "bytes" => value.len());
 
     let mut values = dht.get(key.to_vec());
     while let Some(value) = values.next().await {
-        slog::debug!(log, "{:?}", value);
+        slog::debug!(log, "DHT diagnostic value received"; "bytes" => value.len());
     }
     Ok(())
 }
