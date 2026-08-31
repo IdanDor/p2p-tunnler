@@ -12,7 +12,6 @@
     "ro": [
       "/etc/hosts",
       "/etc/nsswitch.conf",
-      "/proc",
       "/projects/vpn/p2p-tunnler/target/debug",
       "/run/systemd/resolve",
       "/tmp/p2p-tunnler-runtime"
