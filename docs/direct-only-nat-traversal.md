@@ -60,29 +60,11 @@ Useful Rust implementation options are
 
 ## Connection establishment
 
-A fuller future improvement would replace the current immediate-forwarding
-behavior with a small, direct-only ICE-style state machine:
-
-1. Exchange candidate lists, candidate type, expiry, generation, and an
-   ephemeral probe token through the encrypted DHT value.
-2. Build only same-family candidate pairs.
-3. Send authenticated UDP probes from each candidate's own socket to every
-   compatible remote candidate at the same time.
-4. Reply to a valid probe and record its observed source as a peer-reflexive
-   candidate.
-5. Forward WireGuard traffic only after a probe succeeds and select the
-   highest-priority successful pair.
-6. Keep the selected path alive, refresh mapping leases, and gather/probe
-   again after an interface or public-address change.
-
-This uses the useful direct parts of ICE—host, server-reflexive, and
-peer-reflexive candidates plus connectivity checks—while deliberately omitting
-TURN relayed candidates. A failed IPv6 probe therefore becomes an ordinary
-candidate failure, not a tunnel-task failure.
-
-The DHT value needs a short expiry and generation number. A new network or NAT
-mapping must immediately replace old candidates; retaining an old endpoint
-with `--no-clear` is not a reliability mechanism.
+Updated peers will gain direct control-plane path probes as specified in
+[control-plane-probes.md](control-plane-probes.md). That design keeps the
+legacy DHT fields and immediate data forwarding intact for unmodified peers;
+it records verified direct paths without introducing a relay or gating
+WireGuard traffic. It is intentionally smaller than a full ICE state machine.
 
 ## Failure handling
 

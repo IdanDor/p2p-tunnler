@@ -6,6 +6,8 @@
   that must remain compatible with an unmodified 0.1.0 peer.
 - [Direct-only NAT traversal](direct-only-nat-traversal.md): design and
   constraints for direct connectivity without a traffic relay.
+- [Control-plane path probes](control-plane-probes.md): planned idle-path
+  verification protocol for updated peers.
 - [Architecture](architecture.md): data/control-plane boundaries and runtime
   responsibilities.
 - [Code map](code-map.md): source-module ownership and compatibility-sensitive
