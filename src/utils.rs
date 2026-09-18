@@ -1,13 +1,16 @@
 use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use futures::FutureExt;
 use tokio::sync::{mpsc, watch};
 
 pub const UDP_QUEUE_CAPACITY: usize = 256;
+const NETWORK_UNREACHABLE_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct TaskMonitor {
@@ -77,6 +80,10 @@ pub fn try_send<T>(sender: &mpsc::Sender<T>, message: T) -> anyhow::Result<bool>
     }
 }
 
+fn should_retry_udp_send(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NetworkUnreachable
+}
+
 pub fn split_udp_socket(
     monitor: TaskMonitor,
     log: slog::Logger,
@@ -102,14 +109,31 @@ pub fn split_udp_socket(
         },
     );
 
-    spawn(monitor, log, "UDP socket sender", async move {
+    spawn(monitor, log.clone(), "UDP socket sender", async move {
         while let Some((buf, dst)) = rx2.recv().await {
-            let n = sock1.send_to(&buf[..], dst).await?;
-            anyhow::ensure!(
-                n == buf.len(),
-                "UDP socket sent {n} bytes of a {}-byte datagram",
-                buf.len()
-            );
+            loop {
+                match sock1.send_to(&buf[..], dst).await {
+                    Ok(n) => {
+                        anyhow::ensure!(
+                            n == buf.len(),
+                            "UDP socket sent {n} bytes of a {}-byte datagram",
+                            buf.len()
+                        );
+                        break;
+                    }
+                    Err(error) if should_retry_udp_send(&error) => {
+                        slog::warn!(
+                            log,
+                            "UDP network unreachable; retaining datagram for retry";
+                            "destination" => dst,
+                            "bytes" => buf.len(),
+                            "retry_after_seconds" => NETWORK_UNREACHABLE_RETRY_DELAY.as_secs(),
+                        );
+                        tokio::time::sleep(NETWORK_UNREACHABLE_RETRY_DELAY).await;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
         }
         Ok(())
     });
@@ -119,7 +143,7 @@ pub fn split_udp_socket(
 
 #[cfg(test)]
 mod tests {
-    use super::{TaskMonitor, spawn, split_udp_socket, try_send};
+    use super::{TaskMonitor, should_retry_udp_send, spawn, split_udp_socket, try_send};
     use anyhow::Context;
     use std::time::Duration;
 
@@ -170,6 +194,22 @@ mod tests {
         assert_eq!(receiver.try_recv()?, 1);
 
         Ok(())
+    }
+
+    #[test]
+    fn retries_only_network_unreachable_udp_send_errors() {
+        assert!(should_retry_udp_send(&std::io::Error::new(
+            std::io::ErrorKind::NetworkUnreachable,
+            "network is unreachable",
+        )));
+        #[cfg(target_os = "linux")]
+        assert!(should_retry_udp_send(&std::io::Error::from_raw_os_error(
+            libc::ENETUNREACH,
+        )));
+        assert!(!should_retry_udp_send(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        )));
     }
 
     #[test]
