@@ -91,7 +91,7 @@ pub async fn bind_loopback_and_forward(
 
                 let peers = remote_peers.read().await;
                 for remote_peer in peers.addresses() {
-                    let _ = try_send(&to_internet, (packet.to_vec(), remote_peer))?;
+                    let _ = try_send(&to_internet, (packet.clone(), remote_peer))?;
                     slog::debug!(log, "Outbound packet forwarded"; "src" => wireguard_addr, "via_lo" => local_addr, "dst" => remote_peer, "bytes" => packet.len());
                 }
             }
@@ -160,7 +160,7 @@ pub async fn forward_inbound_traffic(
 
         let local_peer = local_peer.read().await;
         if let Some(wireguard_addr) = local_peer.1 {
-            let _ = try_send(&local_peer.0, (packet.to_vec(), wireguard_addr))?;
+            let _ = try_send(&local_peer.0, (packet, wireguard_addr))?;
             slog::debug!(log, "Forwarded inbound packet"; "remote_addr" => remote_peer, "lo_addr" => wireguard_addr);
         } else {
             slog::debug!(

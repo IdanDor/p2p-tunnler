@@ -66,7 +66,9 @@ where
     });
 }
 
-pub type UdpSender = mpsc::Sender<(Vec<u8>, SocketAddr)>;
+/// Outbound datagrams are reference-counted so forwarding to multiple peers
+/// does not copy the payload once per destination.
+pub type UdpSender = mpsc::Sender<(bytes::Bytes, SocketAddr)>;
 pub type UdpReceiver = mpsc::Receiver<(bytes::Bytes, SocketAddr)>;
 
 /// Enqueue a UDP datagram without allowing a congested peer to retain
@@ -89,7 +91,7 @@ pub fn split_udp_socket(
     log: slog::Logger,
     sock: tokio::net::UdpSocket,
 ) -> (UdpSender, UdpReceiver) {
-    let (tx1, mut rx2) = mpsc::channel::<(Vec<u8>, SocketAddr)>(UDP_QUEUE_CAPACITY);
+    let (tx1, mut rx2) = mpsc::channel::<(bytes::Bytes, SocketAddr)>(UDP_QUEUE_CAPACITY);
     let (tx2, rx1) = mpsc::channel::<(bytes::Bytes, SocketAddr)>(UDP_QUEUE_CAPACITY);
 
     let sock = Arc::new(sock);
@@ -112,7 +114,7 @@ pub fn split_udp_socket(
     spawn(monitor, log.clone(), "UDP socket sender", async move {
         while let Some((buf, dst)) = rx2.recv().await {
             loop {
-                match sock1.send_to(&buf[..], dst).await {
+                match sock1.send_to(&buf, dst).await {
                     Ok(n) => {
                         anyhow::ensure!(
                             n == buf.len(),
@@ -161,7 +163,9 @@ mod tests {
                 let peer_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
                 let peer_addr = peer_socket.local_addr()?;
 
-                to_socket.send((b"outbound".to_vec(), peer_addr)).await?;
+                to_socket
+                    .send((bytes::Bytes::from_static(b"outbound"), peer_addr))
+                    .await?;
                 let mut buffer = [0; 64];
                 let (len, source) = tokio::time::timeout(
                     Duration::from_secs(1),

@@ -13,7 +13,7 @@ mod transport;
 mod utils;
 
 fn main() -> anyhow::Result<()> {
-    tokio::runtime::Builder::new_current_thread()
+    tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(app::run())

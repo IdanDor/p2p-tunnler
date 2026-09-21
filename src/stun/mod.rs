@@ -49,7 +49,7 @@ async fn send_request(
 
     let mut buf = bytes::BytesMut::new();
     StunCodec::encode((id, req.clone()), &mut buf)?;
-    if !try_send(to_inet_tx, (buf.to_vec(), stun_server))? {
+    if !try_send(to_inet_tx, (buf.freeze(), stun_server))? {
         bail!("STUN request dropped because the UDP send queue is full");
     }
 

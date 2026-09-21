@@ -138,7 +138,7 @@ impl ProbeController {
         PacketAction::Acknowledged
     }
 
-    async fn due_frames(&self) -> Vec<(Vec<u8>, SocketAddr)> {
+    async fn due_frames(&self) -> Vec<(bytes::Bytes, SocketAddr)> {
         let mut state = self.inner.lock().await;
         let Some(remote_token) = state.remote_token else {
             return Vec::new();
@@ -171,7 +171,10 @@ impl ProbeController {
                 path.fast_stage = path.fast_stage.saturating_add(1);
                 now + delay
             };
-            destinations.push((frame(remote_token).to_vec(), *address));
+            destinations.push((
+                bytes::Bytes::copy_from_slice(&frame(remote_token)),
+                *address,
+            ));
         }
         destinations
     }
@@ -217,7 +220,7 @@ pub async fn handle_packets(
                 if connections.write().await.add_peer_reflexive(source) {
                     slog::info!(log, "Peer-reflexive address admitted by control probe"; "source" => source);
                 }
-                let _ = try_send(&to_internet, (packet.to_vec(), source))?;
+                let _ = try_send(&to_internet, (packet, source))?;
             }
             PacketAction::Acknowledged => {
                 slog::info!(log, "Control path verified this run"; "source" => source);
