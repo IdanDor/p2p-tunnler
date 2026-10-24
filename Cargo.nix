@@ -3408,7 +3408,7 @@ rec {
           {
             name = "tokio";
             packageId = "tokio";
-            features = [ "rt" "net" "sync" "time" ];
+            features = [ "rt-multi-thread" "net" "sync" "time" ];
           }
         ];
 
@@ -4974,7 +4974,7 @@ rec {
           "tracing" = [ "dep:tracing" ];
           "windows-sys" = [ "dep:windows-sys" ];
         };
-        resolvedDefaultFeatures = [ "bytes" "default" "io-util" "libc" "mio" "net" "rt" "socket2" "sync" "time" "windows-sys" ];
+        resolvedDefaultFeatures = [ "bytes" "default" "io-util" "libc" "mio" "net" "rt" "rt-multi-thread" "socket2" "sync" "time" "windows-sys" ];
       };
       "toml" = rec {
         crateName = "toml";
