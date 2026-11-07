@@ -51,12 +51,10 @@ inputs.p2p-tunnler = {
 environment.systemPackages = [ inputs.p2p-tunnler.packages.${pkgs.stdenv.hostPlatform.system}.default ];
 ```
 
-[wireguard-p2p-nix](https://github.com/IdanDor/wireguard-p2p-nix) is a compatibility
-flake entrypoint forwarding these outputs;
-both repositories can be used without consumer-side Cargo/OpenDHT overrides or
-a second source input. Git submodules are unnecessary for flake consumption.
-The legacy `p2p-tunnler-nix` nix-build entrypoints instead use its checked-out
-source submodule.
+[wireguard-p2p-nix](https://github.com/IdanDor/wireguard-p2p-nix) forwards these
+flake outputs. Both repositories support `nix build` from a checkout and use as
+an input in another flake, without consumer-side Cargo/OpenDHT overrides or a
+second source input. Git submodules are unnecessary for flake consumption.
 
 The Nix recipes adapted from `p2p-tunnler-nix` retain its LGPL-2.1+ license,
 included in `nix/LICENSE.p2p-tunnler-nix`. The Rust program remains LGPL-2.1+.
