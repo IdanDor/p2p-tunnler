@@ -18,6 +18,7 @@
   diagnosis.
 - [Sysarmor runtime policy](sysarmor-policy.md): strict local runtime
   confinement for the debug binary and its dedicated configuration directory.
+- [Nix builds](nix.md): flake packages, checks, development shell and consumer use.
 - [Development and AI-assisted work](development.md): validation, dependency,
   and review requirements.
 - [Deferred audit items](deferred-audit-items.md): compatibility-sensitive

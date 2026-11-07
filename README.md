@@ -28,7 +28,16 @@ WireGuard must provide those properties.
 
 ## Quick start
 
-Build with a current Rust toolchain:
+With Nix, build or run the flake without initializing submodules:
+
+```sh
+nix build
+nix run . -- --help
+```
+
+See [Nix builds](docs/nix.md) for checks and the development shell.
+
+Alternatively, build with a current Rust toolchain:
 
 ```sh
 cargo build --release
